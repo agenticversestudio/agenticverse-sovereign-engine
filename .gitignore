@@ -1,0 +1,14 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Sensitive Vault & Local Secrets (DO NOT COMMIT RAW TO PUBLIC GIT)
+vault/
+*.env
+.env.cloud_template
+
+# Local State & Temp
+state.json
+logs/

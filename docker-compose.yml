@@ -1,0 +1,10 @@
+services:
+  agenticverse-orchestrator:
+    build: .
+    container_name: agenticverse_orchestrator
+    restart: always
+    volumes:
+      - ./vault:/root/.config/colab-cli
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
