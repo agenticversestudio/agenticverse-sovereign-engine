@@ -106,10 +106,7 @@ PARAMETER stop "<|endoftext|>"
 
     print(f"[*] Compiling {OLLAMA_MODEL_TAG} in Ollama...")
     os.system(f"{ollama_bin} create {OLLAMA_MODEL_TAG} -f /content/Modelfile.qwen")
-    print("[*] Pre-warming into Tesla T4 VRAM...")
-    os.system(f'{ollama_bin} run {OLLAMA_MODEL_TAG} "Confirm ready"')
-    os.system("nvidia-smi --query-gpu=name,memory.used,memory.free --format=csv,noheader")
-    print("[✓] Model locked in VRAM!")
+    print("[✓] Model compiled into Ollama successfully!")
 
 def launch_gateway_and_tunnel():
     print("[*] Starting Hybrid Gateway on port 8000...")
