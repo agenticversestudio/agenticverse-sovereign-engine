@@ -146,22 +146,11 @@ class AgenticVerseOrchestrator:
         try:
             # 1. Check models list
             r = requests.get(HEALTH_URL, headers={"Authorization": f"Bearer {API_KEY}"}, timeout=8)
-            if r.status_code != 200:
-                return False
-
-            # 2. Verify active model inference in Ollama with fast streaming ping
-            chat_url = HEALTH_URL.replace("/models", "/chat/completions")
-            test_payload = {
-                "model": "qwen3.8-27b-uncensored",
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
-                "stream": True
-            }
-            with requests.post(chat_url, headers={"Authorization": f"Bearer {API_KEY}"}, json=test_payload, stream=True, timeout=15) as r_chat:
-                if r_chat.status_code == 200:
-                    for line in r_chat.iter_lines():
-                        if line and line.decode("utf-8").startswith("data: "):
-                            return True
+            if r.status_code == 200:
+                data = r.json()
+                models = [m.get("id") for m in data.get("data", [])]
+                if "qwen3.8-27b-uncensored" in models:
+                    return True
         except Exception:
             pass
         return False

@@ -12,6 +12,18 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 def health():
     return {"status": "healthy", "service": "AgenticVerse Sovereign AI Gateway", "owner": "Jaggu"}
 
+@app.get("/ps")
+def process_status():
+    import subprocess
+    res_ps = subprocess.run(["ollama", "ps"], capture_output=True, text=True)
+    res_gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.used,memory.free,utilization.gpu", "--format=csv,noheader"], capture_output=True, text=True)
+    return {
+        "status": "online",
+        "active_model": "qwen3.8-27b-uncensored",
+        "gpu_telemetry": res_gpu.stdout.strip(),
+        "ollama_ps": res_ps.stdout.strip()
+    }
+
 @app.get("/v1/models")
 @app.get("/models")
 def list_models():
