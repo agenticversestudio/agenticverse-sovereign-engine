@@ -144,12 +144,21 @@ class AgenticVerseOrchestrator:
 
     def probe_health(self) -> bool:
         try:
+            # 1. Check models list
             r = requests.get(HEALTH_URL, headers={"Authorization": f"Bearer {API_KEY}"}, timeout=8)
-            if r.status_code == 200:
-                data = r.json().get("data", [])
-                models = [m.get("id") for m in data]
-                if "qwen3.8-27b-uncensored" in models or "hybrid-auto" in models:
-                    return True
+            if r.status_code != 200:
+                return False
+
+            # 2. Verify active model inference in Ollama
+            chat_url = HEALTH_URL.replace("/models", "/chat/completions")
+            test_payload = {
+                "model": "qwen3.8-27b-uncensored",
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1
+            }
+            r_chat = requests.post(chat_url, headers={"Authorization": f"Bearer {API_KEY}"}, json=test_payload, timeout=12)
+            if r_chat.status_code == 200 and "choices" in r_chat.json():
+                return True
         except Exception:
             pass
         return False
