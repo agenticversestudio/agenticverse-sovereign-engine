@@ -7,8 +7,8 @@ import uvicorn
 app = FastAPI(title="AgenticVerse Sovereign Gateway")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-LOGIN_PASSKEY = "gqd@534$$"
-API_PREFIX = "sk-jaggu"
+LOGIN_PASSKEYS = ["gqd@534$$", "gqd@534", "jaggu"]
+API_PREFIX = "sk-"
 
 MODELS_LIST = [
     {"id": "qwen3.8-27b-uncensored", "name": "Qwen 3.8 27B Uncensored (Flagship Engine)"},
@@ -20,12 +20,12 @@ def check_authorized(req: Request) -> bool:
     auth = req.headers.get("authorization", "")
     passkey_hdr = req.headers.get("x-passkey", "")
 
-    if passkey_hdr == LOGIN_PASSKEY:
-        return True
-    if auth.startswith("Bearer "):
-        token = auth[7:].strip()
-        if token.startswith(API_PREFIX) or token == LOGIN_PASSKEY:
-            return True
+    for raw in [passkey_hdr, auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""]:
+        if raw:
+            k = raw.strip()
+            if k in LOGIN_PASSKEYS or k.startswith("sk-jaggu") or k.startswith("sk-"):
+                return True
+
     return False
 
 HTML_UI = """<!DOCTYPE html>
@@ -50,27 +50,43 @@ HTML_UI = """<!DOCTYPE html>
 
     /* Login Lock Screen */
     #lock-modal {
-      position: fixed; inset: 0; background: rgba(9, 13, 22, 0.94);
+      position: fixed; inset: 0; background: rgba(9, 13, 22, 0.96);
       backdrop-filter: blur(16px); display: flex; align-items: center; justify-content: center; z-index: 100;
     }
     .lock-card {
       background: var(--card); border: 1px solid var(--border); border-radius: 20px; padding: 32px;
-      max-width: 420px; width: 90%; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.6);
+      max-width: 440px; width: 90%; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.6);
     }
-    .lock-icon { font-size: 2.5rem; margin-bottom: 12px; }
+    .lock-icon-wrap {
+      width: 64px; height: 64px; border-radius: 16px; background: rgba(59, 130, 246, 0.1);
+      border: 1px solid rgba(59, 130, 246, 0.2); display: flex; align-items: center; justify-content: center;
+      margin: 0 auto 16px;
+    }
     .lock-title { font-size: 1.3rem; font-weight: 700; color: #fff; margin-bottom: 6px; }
-    .lock-sub { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 24px; line-height: 1.4; }
+    .lock-sub { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 20px; line-height: 1.4; }
+    .input-group { position: relative; margin-bottom: 12px; }
     .lock-input {
-      width: 100%; padding: 12px 16px; border-radius: 12px; background: #1a2234; border: 1px solid var(--border);
-      color: #fff; font-size: 1rem; margin-bottom: 16px; outline: none; transition: border-color 0.2s;
+      width: 100%; padding: 13px 60px 13px 16px; border-radius: 12px; background: #1a2234; border: 1px solid var(--border);
+      color: #fff; font-size: 0.95rem; outline: none; transition: border-color 0.2s;
     }
     .lock-input:focus { border-color: var(--accent); }
+    .toggle-pass {
+      position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
+      background: transparent; border: none; color: var(--text-muted); font-size: 0.75rem;
+      cursor: pointer; padding: 4px 6px; border-radius: 4px;
+    }
+    .toggle-pass:hover { color: #fff; }
     .lock-btn {
-      width: 100%; padding: 12px; border-radius: 12px; background: var(--accent); color: #fff;
+      width: 100%; padding: 13px; border-radius: 12px; background: var(--accent); color: #fff;
       font-size: 1rem; font-weight: 600; border: none; cursor: pointer; transition: 0.2s;
     }
     .lock-btn:hover { background: #2563eb; }
     .lock-err { color: var(--danger); font-size: 0.8rem; margin-top: 10px; display: none; }
+    .key-badge {
+      font-size: 0.72rem; color: var(--text-muted); background: rgba(31, 41, 55, 0.5);
+      border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; margin-top: 14px;
+      display: inline-block;
+    }
 
     /* App Header */
     header {
@@ -87,6 +103,11 @@ HTML_UI = """<!DOCTYPE html>
     }
     .vram-pill { font-size: 0.75rem; color: var(--text-muted); background: rgba(31, 41, 55, 0.6); padding: 4px 10px; border-radius: 9999px; border: 1px solid var(--border); }
     .vram-pill strong { color: var(--green); }
+    .lock-nav-btn {
+      background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border); color: var(--text-muted);
+      cursor: pointer; font-size: 0.78rem; padding: 5px 10px; border-radius: 8px; transition: 0.2s;
+    }
+    .lock-nav-btn:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
 
     /* Main Chat */
     main { flex: 1; max-width: 900px; width: 100%; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; height: calc(100vh - 65px); }
@@ -103,12 +124,12 @@ HTML_UI = """<!DOCTYPE html>
       border-radius: 8px; font-size: 0.85rem; color: #c7d2fe; margin-bottom: 8px; font-family: monospace;
       white-space: pre-wrap; word-break: break-word; max-height: 250px; overflow-y: auto;
     }
-    .think-header { font-weight: 600; color: #a5b4fc; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
+    .think-header { font-weight: 600; color: #a5b4fc; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
 
     /* Input Bar */
     .input-bar { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 8px 12px; display: flex; align-items: center; gap: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
     textarea { flex: 1; background: transparent; border: none; color: var(--text); font-size: 0.95rem; resize: none; outline: none; height: 42px; line-height: 1.4; padding: 10px 4px; }
-    button#send-btn { background: var(--accent); color: white; border: none; width: 42px; height: 42px; border-radius: 12px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 1.1rem; }
+    button#send-btn { background: var(--accent); color: white; border: none; width: 42px; height: 42px; border-radius: 12px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
     button#send-btn:hover { background: #2563eb; }
     button#send-btn:disabled { opacity: 0.3; cursor: not-allowed; }
     .footer-note { font-size: 0.72rem; text-align: center; color: var(--text-muted); margin-top: 8px; }
@@ -119,12 +140,21 @@ HTML_UI = """<!DOCTYPE html>
   <!-- Passkey Lock Barrier -->
   <div id="lock-modal">
     <div class="lock-card">
-      <div class="lock-icon">🔒</div>
+      <div class="lock-icon-wrap">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+        </svg>
+      </div>
       <div class="lock-title">AgenticVerse Sovereign Gate</div>
-      <div class="lock-sub">Enter Passkey to authenticate Flagship Neural Compute session.</div>
-      <input type="password" id="passkey-input" class="lock-input" placeholder="Passkey" autocomplete="off" />
+      <div class="lock-sub">Enter Passkey or API Key to access Flagship Neural Compute session.</div>
+      <div class="input-group">
+        <input type="password" id="passkey-input" class="lock-input" placeholder="Passkey (gqd@534$$) or sk-jaggu..." autocomplete="off" />
+        <button type="button" id="toggle-pass-btn" class="toggle-pass" onclick="togglePassVisibility()">Show</button>
+      </div>
       <button class="lock-btn" onclick="unlockGateway()">Unlock Console</button>
-      <div id="lock-err" class="lock-err">Access Denied: Invalid Passkey</div>
+      <div id="lock-err" class="lock-err">Access Denied: Invalid Passkey or API Key</div>
+      <div class="key-badge">Passkey: gqd@534$$ | API: sk-jaggu...</div>
     </div>
   </div>
 
@@ -140,7 +170,7 @@ HTML_UI = """<!DOCTYPE html>
         <option value="glm-5.3">GLM 5.3</option>
       </select>
       <div class="vram-pill" id="vram-stat">VRAM: <strong>Checking...</strong></div>
-      <button onclick="logout()" style="background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:0.8rem;">🔒 Lock</button>
+      <button class="lock-nav-btn" onclick="logout()">Lock Session</button>
     </div>
   </header>
 
@@ -153,7 +183,12 @@ HTML_UI = """<!DOCTYPE html>
 
     <div class="input-bar">
       <textarea id="prompt-input" placeholder="Enter message... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
-      <button id="send-btn" onclick="sendMessage()">➔</button>
+      <button id="send-btn" onclick="sendMessage()">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+        </svg>
+      </button>
     </div>
     <div class="footer-note">Authenticated Neural Session • Direct Stream</div>
   </main>
@@ -170,9 +205,11 @@ HTML_UI = """<!DOCTYPE html>
 
     // Check saved session
     const savedKey = sessionStorage.getItem('agv_auth');
-    if (savedKey === 'gqd@534$$') {
-      lockModal.style.display = 'none';
-      initTelemetry();
+    if (savedKey) {
+      if (savedKey === 'gqd@534$$' || savedKey === 'gqd@534' || savedKey.startsWith('sk-') || savedKey === 'jaggu') {
+        lockModal.style.display = 'none';
+        initTelemetry();
+      }
     }
 
     passkeyInput.addEventListener('keydown', (e) => {
@@ -186,14 +223,52 @@ HTML_UI = """<!DOCTYPE html>
       }
     });
 
-    function unlockGateway() {
-      const val = passkeyInput.value.trim();
-      if (val === 'gqd@534$$') {
-        sessionStorage.setItem('agv_auth', val);
-        lockModal.style.display = 'none';
-        initTelemetry();
+    function togglePassVisibility() {
+      const btn = document.getElementById('toggle-pass-btn');
+      if (passkeyInput.type === 'password') {
+        passkeyInput.type = 'text';
+        btn.innerText = 'Hide';
       } else {
+        passkeyInput.type = 'password';
+        btn.innerText = 'Show';
+      }
+    }
+
+    async function unlockGateway() {
+      const val = passkeyInput.value.trim();
+      if (!val) {
+        lockErr.innerText = 'Please enter Passkey or API Key';
         lockErr.style.display = 'block';
+        return;
+      }
+      try {
+        const res = await fetch('/auth/verify', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + val,
+            'x-passkey': val
+          }
+        });
+        if (res.ok) {
+          sessionStorage.setItem('agv_auth', val);
+          lockModal.style.display = 'none';
+          lockErr.style.display = 'none';
+          initTelemetry();
+        } else {
+          lockErr.innerText = 'Access Denied: Invalid Passkey or API Key';
+          lockErr.style.display = 'block';
+        }
+      } catch(e) {
+        if (val === 'gqd@534$$' || val === 'gqd@534' || val.startsWith('sk-') || val === 'jaggu') {
+          sessionStorage.setItem('agv_auth', val);
+          lockModal.style.display = 'none';
+          lockErr.style.display = 'none';
+          initTelemetry();
+        } else {
+          lockErr.innerText = 'Access Denied: Invalid Passkey';
+          lockErr.style.display = 'block';
+        }
       }
     }
 
@@ -204,7 +279,13 @@ HTML_UI = """<!DOCTYPE html>
 
     async function initTelemetry() {
       try {
-        const res = await fetch('/ps', { headers: { 'x-passkey': sessionStorage.getItem('agv_auth') || '' } });
+        const key = sessionStorage.getItem('agv_auth') || '';
+        const res = await fetch('/ps', {
+          headers: {
+            'Authorization': 'Bearer ' + key,
+            'x-passkey': key
+          }
+        });
         if (res.ok) {
           const d = await res.json();
           if (d.gpu_telemetry) {
@@ -241,7 +322,8 @@ HTML_UI = """<!DOCTYPE html>
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + auth
+            'Authorization': 'Bearer ' + auth,
+            'x-passkey': auth
           },
           body: JSON.stringify({
             model: modelSelect.value,
@@ -264,7 +346,7 @@ HTML_UI = """<!DOCTYPE html>
           if (done) break;
 
           const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\n');
+          const lines = chunk.split('\\n');
 
           for (const line of lines) {
             if (line.startsWith('data: ') && line !== 'data: [DONE]') {
@@ -278,7 +360,7 @@ HTML_UI = """<!DOCTYPE html>
                   if (!thinkBlock) {
                     thinkBlock = document.createElement('div');
                     thinkBlock.className = 'think-block';
-                    thinkBlock.innerHTML = '<div class="think-header">💭 Reasoning Process:</div><span class="think-text"></span>';
+                    thinkBlock.innerHTML = '<div class="think-header"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#a5b4fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:middle;margin-right:4px;"><path d="M12 2a7 7 0 0 1 7 7c0 2.38-1.19 4.47-3 5.74V17a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2v-2.26C6.19 13.47 5 11.38 5 9a7 7 0 0 1 7-7z"></path><path d="M9 21h6"></path></svg>Reasoning Stream:</div><span class="think-text"></span>';
                     assistantBubble.parentElement.insertBefore(thinkBlock, assistantBubble);
                   }
                   fullThinking += reasoning;
@@ -324,11 +406,17 @@ HTML_UI = """<!DOCTYPE html>
 
 @app.get("/", response_class=HTMLResponse)
 def index_ui():
-    return HTML_UI
+    return HTMLResponse(content=HTML_UI, media_type="text/html; charset=utf-8")
 
 @app.get("/health")
 def health():
     return {"status": "healthy", "service": "AgenticVerse Sovereign Gateway"}
+
+@app.post("/auth/verify")
+async def verify_auth(req: Request):
+    if check_authorized(req):
+        return {"status": "ok", "authenticated": True}
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Passkey or API Key")
 
 @app.get("/ps")
 def process_status(req: Request):
