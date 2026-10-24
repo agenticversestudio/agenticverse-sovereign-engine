@@ -149,16 +149,19 @@ class AgenticVerseOrchestrator:
             if r.status_code != 200:
                 return False
 
-            # 2. Verify active model inference in Ollama
+            # 2. Verify active model inference in Ollama with fast streaming ping
             chat_url = HEALTH_URL.replace("/models", "/chat/completions")
             test_payload = {
                 "model": "qwen3.8-27b-uncensored",
                 "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1
+                "max_tokens": 1,
+                "stream": True
             }
-            r_chat = requests.post(chat_url, headers={"Authorization": f"Bearer {API_KEY}"}, json=test_payload, timeout=12)
-            if r_chat.status_code == 200 and "choices" in r_chat.json():
-                return True
+            with requests.post(chat_url, headers={"Authorization": f"Bearer {API_KEY}"}, json=test_payload, stream=True, timeout=15) as r_chat:
+                if r_chat.status_code == 200:
+                    for line in r_chat.iter_lines():
+                        if line and line.decode("utf-8").startswith("data: "):
+                            return True
         except Exception:
             pass
         return False
