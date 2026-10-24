@@ -95,7 +95,7 @@ TEMPLATE \"\"\"{{{{ if .System }}}}<|im_start|>system
 \"\"\"
 
 PARAMETER num_gpu 99
-PARAMETER num_ctx 3072
+PARAMETER num_ctx 2560
 PARAMETER temperature 0.6
 PARAMETER top_p 0.95
 PARAMETER stop "<|im_end|>"
@@ -105,9 +105,9 @@ PARAMETER stop "<|endoftext|>"
         f.write(modelfile)
 
     print(f"[*] Compiling {OLLAMA_MODEL_TAG} in Ollama...")
-    os.system(f"{ollama_bin} create {OLLAMA_MODEL_TAG} -f /content/Modelfile.qwen")
+    os.system(f"{ollama_bin} create {OLLAMA_MODEL_TAG} -f /content/Modelfile.qwen > /content/create.log 2>&1")
     print("[*] Pre-warming into Tesla T4 VRAM...")
-    os.system(f'{ollama_bin} run {OLLAMA_MODEL_TAG} "Confirm ready"')
+    os.system(f'echo "Ready" | {ollama_bin} run {OLLAMA_MODEL_TAG} > /dev/null 2>&1')
     os.system("nvidia-smi --query-gpu=name,memory.used,memory.free --format=csv,noheader")
     print("[✓] Model pre-warmed and locked in VRAM!")
 

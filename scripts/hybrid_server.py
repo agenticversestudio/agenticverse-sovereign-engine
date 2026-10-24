@@ -99,9 +99,11 @@ HTML_UI = """<!DOCTYPE html>
     .msg.user .bubble { background: linear-gradient(135deg, #2563eb, #1d4ed8); color: white; border-bottom-right-radius: 4px; }
     .msg.assistant .bubble { background: var(--card); border: 1px solid var(--border); color: var(--text); border-bottom-left-radius: 4px; }
     .think-block {
-      background: rgba(31, 41, 55, 0.4); border-left: 3px solid #6366f1; padding: 8px 12px;
-      border-radius: 4px; font-size: 0.85rem; color: #a5b4fc; margin-bottom: 8px; font-style: italic;
+      background: rgba(30, 41, 59, 0.7); border-left: 3px solid #818cf8; padding: 10px 14px;
+      border-radius: 8px; font-size: 0.85rem; color: #c7d2fe; margin-bottom: 8px; font-family: monospace;
+      white-space: pre-wrap; word-break: break-word; max-height: 250px; overflow-y: auto;
     }
+    .think-header { font-weight: 600; color: #a5b4fc; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
 
     /* Input Bar */
     .input-bar { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 8px 12px; display: flex; align-items: center; gap: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
@@ -230,7 +232,9 @@ HTML_UI = """<!DOCTYPE html>
       history.push({ role: 'user', content: text });
 
       const assistantBubble = appendMsg('assistant', '');
+      let fullThinking = '';
       let fullReply = '';
+      let thinkBlock = null;
 
       try {
         const response = await fetch('/v1/chat/completions', {
@@ -260,16 +264,35 @@ HTML_UI = """<!DOCTYPE html>
           if (done) break;
 
           const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\\n');
+          const lines = chunk.split('\n');
 
           for (const line of lines) {
             if (line.startsWith('data: ') && line !== 'data: [DONE]') {
               try {
                 const data = JSON.parse(line.substring(6));
-                const delta = data.choices[0]?.delta?.content || '';
-                fullReply += delta;
-                assistantBubble.innerText = fullReply;
-                chatBox.scrollTop = chatBox.scrollHeight;
+                const deltaObj = data.choices[0]?.delta || {};
+
+                // Handle live thinking stream
+                const reasoning = deltaObj.reasoning || deltaObj.reasoning_content || '';
+                if (reasoning) {
+                  if (!thinkBlock) {
+                    thinkBlock = document.createElement('div');
+                    thinkBlock.className = 'think-block';
+                    thinkBlock.innerHTML = '<div class="think-header">💭 Reasoning Process:</div><span class="think-text"></span>';
+                    assistantBubble.parentElement.insertBefore(thinkBlock, assistantBubble);
+                  }
+                  fullThinking += reasoning;
+                  thinkBlock.querySelector('.think-text').innerText = fullThinking;
+                  chatBox.scrollTop = chatBox.scrollHeight;
+                }
+
+                // Handle regular response content
+                const content = deltaObj.content || '';
+                if (content) {
+                  fullReply += content;
+                  assistantBubble.innerText = fullReply;
+                  chatBox.scrollTop = chatBox.scrollHeight;
+                }
               } catch(e) {}
             }
           }
@@ -349,6 +372,18 @@ async def stream_ollama(model: str, messages: list, temperature: float = 0.6, ma
             async with client.stream("POST", url, json=payload) as response:
                 async for chunk in response.aiter_lines():
                     if chunk:
+                        if chunk.startswith("data: ") and chunk != "data: [DONE]":
+                            try:
+                                data = json.loads(chunk[6:])
+                                choices = data.get("choices", [])
+                                if choices:
+                                    delta = choices[0].get("delta", {})
+                                    if "reasoning" in delta and "reasoning_content" not in delta:
+                                        delta["reasoning_content"] = delta["reasoning"]
+                                        yield f"data: {json.dumps(data)}\n\n"
+                                        continue
+                            except Exception:
+                                pass
                         yield f"{chunk}\n\n"
     except Exception as e:
         err = {"error": {"message": str(e), "type": "gateway_error"}}
