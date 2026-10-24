@@ -97,13 +97,10 @@ class CloudHealthHandler(BaseHTTPRequestHandler):
         elapsed_hrs = (time.time() - started) / 3600.0 if started > 0 else 0.0
 
         resp_data = {
-            "service": "AgenticVerse 24/7 Sovereign Cloud Orchestrator",
-            "owner": "Jaggu (AgenticVerse)",
-            "status": state.get("status", "running"),
-            "active_shift": account_name,
-            "running_hours": round(elapsed_hrs, 2),
-            "total_rotations": state.get("total_rotations", 0),
-            "target_ingress": HEALTH_URL,
+            "status": "online",
+            "service": "AgenticVerse Sovereign Cloud Orchestrator",
+            "engine": state.get("status", "running"),
+            "uptime_hours": round(elapsed_hrs, 2),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
 
