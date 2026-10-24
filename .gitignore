@@ -8,6 +8,8 @@ __pycache__/
 vault/
 *.env
 .env.cloud_template
+render_manager.py
+deploy_*.py
 
 # Local State & Temp
 state.json
