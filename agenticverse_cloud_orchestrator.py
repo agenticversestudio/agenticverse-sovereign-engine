@@ -216,8 +216,10 @@ class AgenticVerseOrchestrator:
         # 4. Wait for warmup
         logger.info("[*] Awaiting model lock into VRAM & Ngrok tunnel activation...")
         warmup_start = time.time()
-        while time.time() - warmup_start < 360:
+        poll_step = 0
+        while time.time() - warmup_start < 480:
             time.sleep(15)
+            poll_step += 1
             if self.probe_health():
                 logger.info("=" * 65)
                 logger.info(f"🚀 [✓] SHIFT IS ONLINE & RESPONDING TO POCKETSTRIKE!")
@@ -228,6 +230,19 @@ class AgenticVerseOrchestrator:
                 self.state["status"] = "running"
                 save_state(self.state)
                 return True
+
+            if poll_step % 2 == 0:
+                try:
+                    read_script = os.path.join(SCRIPTS_DIR, "read_remote_log.py")
+                    p_res = subprocess.run(
+                        ["colab", "exec", "-s", "agenticverse_engine", "-f", read_script],
+                        capture_output=True, text=True, timeout=15
+                    )
+                    out = p_res.stdout.strip()
+                    if out and out != "0":
+                        logger.info(f"[Remote GPU Progress]\n{out}")
+                except Exception:
+                    pass
 
         logger.warning("[!] Warmup period elapsed; Continuing health supervision.")
         return False

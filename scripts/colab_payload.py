@@ -29,11 +29,15 @@ LOCAL_SERVER_PORT = 8000
 
 def install_system_dependencies():
     print("[*] Installing system dependencies (aria2, ngrok, uvicorn)...")
-    os.system("apt-get update -qq && apt-get install -y -qq aria2 ngrok > /dev/null 2>&1")
+    os.system("apt-get update -qq && apt-get install -y -qq aria2 curl > /dev/null 2>&1")
+    if not shutil.which("ngrok"):
+        print("[*] Installing official Ngrok binary...")
+        os.system("curl -fsSL https://bin.ngrok.com/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar -xz -C /usr/local/bin > /dev/null 2>&1")
+        os.system("chmod +x /usr/local/bin/ngrok || true")
     if not shutil.which("ollama"):
         print("[*] Installing Ollama...")
         os.system("curl -fsSL https://ollama.com/install.sh | sh > /dev/null 2>&1")
-    os.system("pip install -q fastapi uvicorn requests httpx pydantic > /dev/null 2>&1")
+    os.system("pip install -q fastapi uvicorn requests httpx pydantic pyngrok > /dev/null 2>&1")
     print("[✓] Dependencies installed!")
 
 def ensure_model_weights():
