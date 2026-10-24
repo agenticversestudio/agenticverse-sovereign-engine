@@ -16,8 +16,8 @@ RUN pip install --no-cache-dir requests google-colab-cli
 COPY agenticverse_cloud_orchestrator.py /app/
 COPY scripts/ /app/scripts/
 
-# Health check probe
-HEALTHCHECK --interval=60s --timeout=15s --start-period=60s --retries=3 \
-    CMD python -c "import requests; r = requests.get('https://eel-feminine-progeny.ngrok-free.dev/v1/models', headers={'Authorization': 'Bearer sk-jaggu'}); exit(0 if r.status_code == 200 else 1)"
+# Health check probe against local HTTP keep-alive server
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD python -c "import os, requests; port = os.environ.get('PORT', '8080'); r = requests.get(f'http://127.0.0.1:{port}/'); exit(0 if r.status_code == 200 else 1)"
 
 CMD ["python", "agenticverse_cloud_orchestrator.py"]
