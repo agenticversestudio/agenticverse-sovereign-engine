@@ -28,15 +28,22 @@ OLLAMA_MODEL_TAG = "qwen3.8-27b-uncensored"
 LOCAL_SERVER_PORT = 8000
 
 def install_system_dependencies():
-    print("[*] Installing system dependencies (aria2, ngrok, uvicorn)...")
-    os.system("apt-get update -qq && apt-get install -y -qq aria2 curl > /dev/null 2>&1")
+    print("[*] Installing system dependencies (aria2, ngrok, uvicorn, pciutils)...")
+    os.system("apt-get update -qq && apt-get install -y -qq aria2 curl pciutils zstd > /dev/null 2>&1")
     if not shutil.which("ngrok"):
         print("[*] Installing official Ngrok binary...")
         os.system("curl -fsSL https://bin.ngrok.com/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar -xz -C /usr/local/bin > /dev/null 2>&1")
         os.system("chmod +x /usr/local/bin/ngrok || true")
-    if not shutil.which("ollama"):
-        print("[*] Installing Ollama...")
-        os.system("curl -fsSL https://ollama.com/install.sh | sh > /dev/null 2>&1")
+
+    ollama_path = shutil.which("ollama") or "/usr/local/bin/ollama"
+    if not os.path.exists(ollama_path):
+        print("[*] Installing official Ollama Linux AMD64 package...")
+        os.system("curl -fsSL https://ollama.com/download/ollama-linux-amd64.tgz | tar -xz -C /usr/local > /dev/null 2>&1")
+        os.system("chmod +x /usr/local/bin/ollama || true")
+        if not os.path.exists("/usr/local/bin/ollama"):
+            print("[*] Fallback: running install.sh...")
+            os.system("curl -fsSL https://ollama.com/install.sh | sh > /dev/null 2>&1")
+
     os.system("pip install -q fastapi uvicorn requests httpx pydantic pyngrok > /dev/null 2>&1")
     print("[✓] Dependencies installed!")
 
@@ -59,7 +66,9 @@ def ensure_model_weights():
     return local_path
 
 def launch_ollama_daemon(weights_path):
-    print("[*] Launching Ollama daemon in background...")
+    os.environ["PATH"] = f"/usr/local/bin:/usr/bin:/bin:{os.environ.get('PATH', '')}"
+    ollama_bin = shutil.which("ollama") or "/usr/local/bin/ollama"
+    print(f"[*] Launching Ollama daemon ({ollama_bin}) in background...")
     os.environ["OLLAMA_HOST"] = "0.0.0.0:11434"
     os.environ["OLLAMA_KEEP_ALIVE"] = "-1"
     os.environ["OLLAMA_NUM_PARALLEL"] = "1"
@@ -68,7 +77,7 @@ def launch_ollama_daemon(weights_path):
     time.sleep(2)
 
     subprocess.Popen(
-        ["ollama", "serve"],
+        [ollama_bin, "serve"],
         stdout=open("/content/ollama_stdout.log", "a"),
         stderr=open("/content/ollama_stderr.log", "a"),
         preexec_fn=os.setpgrp
@@ -97,9 +106,9 @@ PARAMETER stop "<|endoftext|>"
         f.write(modelfile)
 
     print(f"[*] Compiling {OLLAMA_MODEL_TAG} in Ollama...")
-    os.system(f"ollama create {OLLAMA_MODEL_TAG} -f /content/Modelfile.qwen")
+    os.system(f"{ollama_bin} create {OLLAMA_MODEL_TAG} -f /content/Modelfile.qwen")
     print("[*] Pre-warming into Tesla T4 VRAM...")
-    os.system(f'ollama run {OLLAMA_MODEL_TAG} "Confirm ready"')
+    os.system(f'{ollama_bin} run {OLLAMA_MODEL_TAG} "Confirm ready"')
     os.system("nvidia-smi --query-gpu=name,memory.used,memory.free --format=csv,noheader")
     print("[✓] Model locked in VRAM!")
 
@@ -114,13 +123,14 @@ def launch_gateway_and_tunnel():
     )
     time.sleep(3)
 
-    print(f"[*] Binding Ngrok tunnel to https://{NGROK_DOMAIN}...")
-    os.system(f"ngrok config add-authtoken {NGROK_TOKEN} > /dev/null 2>&1")
+    ngrok_bin = shutil.which("ngrok") or "/usr/local/bin/ngrok"
+    print(f"[*] Binding Ngrok tunnel to https://{NGROK_DOMAIN} via {ngrok_bin}...")
+    os.system(f"{ngrok_bin} config add-authtoken {NGROK_TOKEN} > /dev/null 2>&1")
     os.system("pkill -9 -f 'ngrok' || true")
     time.sleep(1)
 
     subprocess.Popen(
-        ["ngrok", "http", str(LOCAL_SERVER_PORT), f"--domain={NGROK_DOMAIN}"],
+        [ngrok_bin, "http", str(LOCAL_SERVER_PORT), f"--domain={NGROK_DOMAIN}"],
         stdout=open("/content/ngrok.log", "a"),
         stderr=subprocess.STDOUT,
         preexec_fn=os.setpgrp
