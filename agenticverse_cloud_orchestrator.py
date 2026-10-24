@@ -175,11 +175,18 @@ class AgenticVerseOrchestrator:
         logger.info(f"[✓] Active Colab CLI token deployed for: {account['name']}")
 
     def terminate_current_session(self):
-        logger.info("[*] Releasing active Colab cloud sessions...")
+        logger.info("[*] Releasing active Colab cloud sessions on server...")
         try:
-            subprocess.run(["colab", "stop"], capture_output=True, text=True, timeout=30)
+            from colab_cli.auth import get_credentials, AuthProvider
+            from colab_cli.client import Client, Prod
+            creds = get_credentials(os.path.expanduser("~/.colab-cli-oauth-config.json"), provider=AuthProvider.OAUTH2)
+            cli = Client(Prod(), creds)
+            assignments = cli.list_assignments()
+            for a in assignments:
+                logger.info(f"[*] Releasing server session: {a.endpoint}")
+                cli.unassign(a.endpoint)
         except Exception as e:
-            logger.warning(f"Notice stopping session: {e}")
+            logger.debug(f"Notice during unassign: {e}")
 
     def launch_shift(self, account_index: int):
         account = ACCOUNTS[account_index]
@@ -191,11 +198,8 @@ class AgenticVerseOrchestrator:
         # 1. Deploy token for target account
         self.deploy_token(account_index)
 
-        # 2. Clean up any existing session on this account
-        try:
-            subprocess.run(["colab", "stop", "-s", "agenticverse_engine"], capture_output=True, text=True, timeout=20)
-        except Exception:
-            pass
+        # 2. Release any previous session on this account
+        self.terminate_current_session()
 
         # 3. Provision Headless T4 GPU VM
         logger.info("[*] Instantiating Tesla T4 GPU VM on Colab...")
@@ -270,13 +274,15 @@ class AgenticVerseOrchestrator:
         return False
 
     def rotate_shift(self, reason: str):
-        next_index = (self.state["current_account_index"] + 1) % len(ACCOUNTS)
+        next_index = (self.state.get("current_account_index", 0) + 1) % len(ACCOUNTS)
         logger.info("=" * 65)
         logger.info(f"🔄 ROTATION TRIGGERED: {reason}")
-        logger.info(f"Current Slot: {self.state['current_account_index']} ➔ Next Slot: {next_index}")
+        logger.info(f"Current Slot: {self.state.get('current_account_index', 0)} ➔ Next Slot: {next_index}")
         logger.info("=" * 65)
 
+        self.state["current_account_index"] = next_index
         self.state["total_rotations"] += 1
+        save_state(self.state)
         self.launch_shift(next_index)
 
     def run(self):
