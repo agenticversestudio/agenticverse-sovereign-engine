@@ -173,21 +173,34 @@ class AgenticVerseOrchestrator:
             logger.warning(f"Notice stopping session: {e}")
 
     def launch_shift(self, account_index: int):
-        self.terminate_current_session()
         account = ACCOUNTS[account_index]
 
         logger.info("=" * 65)
         logger.info(f"🚀 PROVISIONING SHIFT: {account['name']}")
         logger.info("=" * 65)
 
+        # 1. Deploy token for target account
         self.deploy_token(account_index)
 
-        # 1. Provision Headless T4 VM
+        # 2. Clean up any existing session on this account
+        try:
+            subprocess.run(["colab", "stop", "-s", "agenticverse_engine"], capture_output=True, text=True, timeout=20)
+        except Exception:
+            pass
+
+        # 3. Provision Headless T4 GPU VM
         logger.info("[*] Instantiating Tesla T4 GPU VM on Colab...")
         res = subprocess.run(["colab", "new", "-s", "agenticverse_engine", "--gpu", "T4"], capture_output=True, text=True)
-        logger.info(f"Colab Provision Status: {res.stdout.strip()}")
+        combined_output = f"{res.stdout.strip()} {res.stderr.strip()}".strip()
+        logger.info(f"Colab Provision Status: {combined_output}")
 
-        # 2. Upload hybrid_server.py and colab_payload.py
+        if res.returncode != 0 or "refused" in combined_output.lower() or "limit" in combined_output.lower():
+            logger.warning(f"⚠️ GPU VM provision failed for {account['name']}. Rotating to backup account...")
+            time.sleep(5)
+            self.rotate_shift(f"GPU Quota/Precondition on {account['name']}")
+            return False
+
+        # 4. Upload decoupled server files directly to Colab container
         server_local = os.path.join(SCRIPTS_DIR, "hybrid_server.py")
         payload_local = os.path.join(SCRIPTS_DIR, "colab_payload.py")
 
@@ -195,17 +208,17 @@ class AgenticVerseOrchestrator:
         subprocess.run(["colab", "upload", "-s", "agenticverse_engine", server_local, "/content/hybrid_server.py"], capture_output=True, text=True)
         subprocess.run(["colab", "upload", "-s", "agenticverse_engine", payload_local, "/content/colab_payload.py"], capture_output=True, text=True)
 
-        # 3. Trigger remote execution via detached launcher script
+        # 5. Trigger remote execution via detached launcher script
         launcher_file = os.path.join(BASE_DIR, "launch_payload.py")
         with open(launcher_file, "w", encoding="utf-8") as f:
             f.write("import os\nos.system('nohup python3 /content/colab_payload.py > /content/payload.log 2>&1 &')\n")
 
         logger.info("[*] Triggering detached setup payload on remote GPU...")
-        res = subprocess.run(
+        res_exec = subprocess.run(
             ["colab", "exec", "-s", "agenticverse_engine", "-f", launcher_file],
             capture_output=True, text=True, timeout=60
         )
-        logger.info(f"Colab Exec Launcher Result: stdout='{res.stdout.strip()}' stderr='{res.stderr.strip()}'")
+        logger.info(f"Colab Exec Launcher Result: stdout='{res_exec.stdout.strip()}' stderr='{res_exec.stderr.strip()}'")
 
         self.state["current_account_index"] = account_index
         self.state["shift_started_at"] = time.time()
