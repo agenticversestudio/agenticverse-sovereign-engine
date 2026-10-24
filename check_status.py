@@ -52,11 +52,32 @@ def print_status():
         if r.status_code == 200:
             print(f"⚡ Engine Health:         ONLINE (HTTP 200, Latency: {lat:.0f}ms)")
             models = [m.get("id") for m in r.json().get("data", [])]
-            print(f"🧠 Active Muscle:         {', '.join(models)}")
+            print(f"🧠 Available Models:      {', '.join(models)}")
         else:
             print(f"⚡ Engine Health:         STANDBY (HTTP {r.status_code})")
     except Exception as e:
         print(f"⚡ Engine Health:         DISCONNECTED ({e})")
+
+    # Cloud Orchestrator Health
+    try:
+        r_cloud = requests.get("https://agenticverse-engine.onrender.com", timeout=6)
+        if r_cloud.status_code == 200:
+            cdata = r_cloud.json()
+            print(f"☁️  Render Orchestrator:  ONLINE (Shift: {cdata.get('active_shift')}, Running: {cdata.get('running_hours')}h)")
+    except Exception:
+        pass
+
+    # GPU Telemetry
+    try:
+        r_ps = requests.get("https://eel-feminine-progeny.ngrok-free.dev/ps", timeout=6)
+        if r_ps.status_code == 200:
+            psdata = r_ps.json()
+            print(f"🎮 GPU Telemetry:         {psdata.get('gpu_telemetry')}")
+            ollama_line = psdata.get('ollama_ps', '').splitlines()
+            if len(ollama_line) > 1:
+                print(f"🔥 VRAM Lock Status:      {ollama_line[1]}")
+    except Exception:
+        pass
     print("=" * 65)
 
 if __name__ == "__main__":
