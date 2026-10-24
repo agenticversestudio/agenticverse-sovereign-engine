@@ -20,7 +20,7 @@ import logging
 import threading
 import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime
+from datetime import datetime, timezone
 import requests
 
 # UTF-8 Encoding Guard
@@ -104,7 +104,7 @@ class CloudHealthHandler(BaseHTTPRequestHandler):
             "running_hours": round(elapsed_hrs, 2),
             "total_rotations": state.get("total_rotations", 0),
             "target_ingress": HEALTH_URL,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
 
         self.send_response(200)
@@ -195,13 +195,17 @@ class AgenticVerseOrchestrator:
         subprocess.run(["colab", "upload", "-s", "agenticverse_engine", server_local, "/content/hybrid_server.py"], capture_output=True, text=True)
         subprocess.run(["colab", "upload", "-s", "agenticverse_engine", payload_local, "/content/colab_payload.py"], capture_output=True, text=True)
 
-        # 3. Execute payload on Colab VM with adequate timeout
-        logger.info("[*] Triggering setup payload on remote GPU...")
-        subprocess.Popen(
-            ["colab", "exec", "-s", "agenticverse_engine", "--timeout", "600", "python3 /content/colab_payload.py"],
-            stdout=open(os.path.join(LOGS_DIR, "colab_execution.log"), "a", encoding="utf-8"),
-            stderr=subprocess.STDOUT
+        # 3. Trigger remote execution via detached launcher script
+        launcher_file = os.path.join(BASE_DIR, "launch_payload.py")
+        with open(launcher_file, "w", encoding="utf-8") as f:
+            f.write("import os\nos.system('nohup python3 /content/colab_payload.py > /content/payload.log 2>&1 &')\n")
+
+        logger.info("[*] Triggering detached setup payload on remote GPU...")
+        res = subprocess.run(
+            ["colab", "exec", "-s", "agenticverse_engine", "-f", launcher_file],
+            capture_output=True, text=True, timeout=60
         )
+        logger.info(f"Colab Exec Launcher Result: stdout='{res.stdout.strip()}' stderr='{res.stderr.strip()}'")
 
         self.state["current_account_index"] = account_index
         self.state["shift_started_at"] = time.time()
@@ -212,7 +216,7 @@ class AgenticVerseOrchestrator:
         # 4. Wait for warmup
         logger.info("[*] Awaiting model lock into VRAM & Ngrok tunnel activation...")
         warmup_start = time.time()
-        while time.time() - warmup_start < 240:
+        while time.time() - warmup_start < 360:
             time.sleep(15)
             if self.probe_health():
                 logger.info("=" * 65)
