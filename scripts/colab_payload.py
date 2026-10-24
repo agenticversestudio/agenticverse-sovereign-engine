@@ -17,9 +17,8 @@ import subprocess
 import threading
 import requests
 
-HF_TOKEN = "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"
-HF_MODEL_URL = "https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-GGUF/resolve/main/Qwen3.8-27B-Uncensored-Q3_K_M.gguf"
-MODEL_FILENAME = "Qwen3.8-27B-Uncensored-Q3_K_M.gguf"
+HF_MODEL_URL = "https://huggingface.co/JonathanColetti/Qwen3.8-27B-Uncensored-GGUF/resolve/main/Qwen3.8-27B-Uncensored-IQ4_XS.gguf"
+MODEL_FILENAME = "Qwen3.8-27B-Uncensored-IQ4_XS.gguf"
 
 NGROK_TOKEN = "3L0j211a2jZQjRcD8UrFSIZaKrK_41HPHuJ2drV1rnJEwrvtj"
 NGROK_DOMAIN = "eel-feminine-progeny.ngrok-free.dev"
@@ -61,7 +60,7 @@ def ensure_model_weights():
 
     local_path = f"/content/{MODEL_FILENAME}"
     print(f"[*] Downloading weights via 16-stream aria2c to {local_path}...")
-    cmd = f'aria2c -c -x 16 -s 16 -k 1M --header="Authorization: Bearer {HF_TOKEN}" "{HF_MODEL_URL}" -d "/content" -o "{MODEL_FILENAME}"'
+    cmd = f'aria2c -c -x 16 -s 16 -k 1M "{HF_MODEL_URL}" -d "/content" -o "{MODEL_FILENAME}"'
     os.system(cmd)
     return local_path
 
