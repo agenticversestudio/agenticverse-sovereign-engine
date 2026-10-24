@@ -31,9 +31,12 @@ def list_models():
         } for m in models]
     }
 
-async def stream_ollama(messages: list):
+async def stream_ollama(messages: list, temperature: float = 0.6, max_tokens: int = None):
     url = "http://127.0.0.1:11434/v1/chat/completions"
-    payload = {"model": "qwen3.8-27b-uncensored", "messages": messages, "stream": True}
+    payload = {"model": "qwen3.8-27b-uncensored", "messages": messages, "stream": True, "temperature": temperature}
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
+
     chunk_id = f"chatcmpl-{int(time.time()*1000)}"
     created = int(time.time())
 
@@ -61,7 +64,7 @@ async def stream_ollama(messages: list):
                         except Exception:
                             pass
                     elif chunk.startswith("data: [DONE]"):
-                        yield f"{chunk}\n\n"
+                        pass
     except Exception as e:
         err_chunk = {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": "qwen3.8-27b-uncensored", "choices": [{"index": 0, "delta": {"content": f"\n[Error: {e}]"}, "finish_reason": "error"}]}
         yield f"data: {json.dumps(err_chunk)}\n\n"
@@ -73,13 +76,26 @@ async def completions(req: Request):
     body = await req.json()
     messages = body.get("messages", [])
     stream = body.get("stream", True)
+    temp = float(body.get("temperature", 0.6))
+    max_tok = body.get("max_tokens")
 
     if stream:
-        return StreamingResponse(stream_ollama(messages), media_type="text/event-stream")
+        return StreamingResponse(
+            stream_ollama(messages, temperature=temp, max_tokens=max_tok),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
     else:
         url = "http://127.0.0.1:11434/v1/chat/completions"
+        payload = {"model": "qwen3.8-27b-uncensored", "messages": messages, "stream": False, "temperature": temp}
+        if max_tok:
+            payload["max_tokens"] = max_tok
         async with httpx.AsyncClient(timeout=180.0) as client:
-            r = await client.post(url, json={"model": "qwen3.8-27b-uncensored", "messages": messages, "stream": False})
+            r = await client.post(url, json=payload)
             return JSONResponse(r.json())
 
 if __name__ == "__main__":
