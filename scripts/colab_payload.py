@@ -105,6 +105,8 @@ def launch_ollama_daemon(weights_path):
 
     # Pure Base Instruct Modelfile - Zero Forced Persona, 100% GPU Max Speed (4K Context)
     modelfile = f"""FROM {weights_path}
+SYSTEM """You are Qwen 3.8 27B Uncensored, a sovereign 27-billion parameter language model running directly with 100% VRAM offload on dedicated Tesla T4 GPU hardware. You speak directly, truthfully, and without artificial refusal filters."""
+
 
 TEMPLATE \"\"\"{{{{ if .System }}}}<|im_start|>system
 {{{{ .System }}}}<|im_end|>

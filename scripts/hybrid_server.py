@@ -598,9 +598,9 @@ async def stream_ollama(model: str, messages: list, temperature: float = 0.6, ma
                                 pass
                         yield f"{chunk}\n\n"
     except Exception as e:
-        # Ollama failed before/while streaming; fall back to the Groq twin of this model
-        async for chunk in stream_groq(get_groq_model(DEFAULT_MODEL), messages, temperature, max_tokens):
-            yield chunk
+        err = {"error": {"message": f"Qwen 3.8 27B inference error on Tesla T4: {str(e)}", "type": "gpu_engine_error"}}
+        yield f"data: {json.dumps(err)}\n\n"
+        yield "data: [DONE]\n\n" 
 
 async def resolve_route(model: str):
     """Return (backend, upstream_model). Unknown model ids raise 404 instead of silently remapping."""
