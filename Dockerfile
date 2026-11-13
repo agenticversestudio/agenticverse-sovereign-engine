@@ -1,23 +1,20 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
-# Install system utilities and Colab CLI dependencies
+WORKDIR /app
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     procps \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Python requirements and official Colab CLI
-RUN pip install --no-cache-dir requests google-colab-cli
+COPY . .
 
-# Copy Orchestrator codebase
-COPY agenticverse_cloud_orchestrator.py /app/
-COPY scripts/ /app/scripts/
-
-# Health check probe against local HTTP keep-alive server
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD python -c "import os, requests; port = os.environ.get('PORT', '8080'); r = requests.get(f'http://127.0.0.1:{port}/'); exit(0 if r.status_code == 200 else 1)"
+ENV PORT=8080
+EXPOSE 8080
 
 CMD ["python", "agenticverse_cloud_orchestrator.py"]

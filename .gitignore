@@ -14,3 +14,8 @@ deploy_*.py
 # Local State & Temp
 state.json
 logs/
+_secrets.json
+.env
+*.orig.bak
+*.orig.py
+make_env.py

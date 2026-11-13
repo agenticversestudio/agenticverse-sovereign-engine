@@ -5,25 +5,73 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 app = FastAPI(title="AgenticVerse Sovereign Gateway")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"]
+)
 
-LOGIN_PASSKEYS = ["gqd@534$$", "gqd@534", "jaggu"]
-API_PREFIX = "sk-"
+@app.options("/{full_path:path}")
+async def options_handler(request: Request, full_path: str):
+    response = JSONResponse({"status": "ok", "path": full_path})
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response
 
+# --- Secrets are NOT stored in code. They come from /content/secrets.json (uploaded by the
+# orchestrator at start) or from environment variables. See agenticverse/.env.example ---
+def _load_secrets():
+    path = os.environ.get("GATEWAY_SECRETS", "/content/secrets.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+_S = _load_secrets()
+API_KEY = _S.get("api_key") or os.environ.get("AGENTIC_API_KEY", "")
+PASSKEY = _S.get("passkey") or os.environ.get("AGENTIC_PASSKEY", "")
+LOGIN_USER = _S.get("login_user") or os.environ.get("AGENTIC_LOGIN_USER", "")
+_extra = _S.get("extra_api_keys") or os.environ.get("EXTRA_API_KEYS", "")
+EXTRA_KEYS = [k.strip() for k in (_extra.split(",") if isinstance(_extra, str) else _extra) if k and k.strip()]
+LOGIN_PASSKEYS = [PASSKEY] if PASSKEY else []
+VALID_USERS = {LOGIN_USER: PASSKEY} if (LOGIN_USER and PASSKEY) else {}
+VALID_API_KEYS = [k for k in [API_KEY] + EXTRA_KEYS if k]
+if not VALID_API_KEYS and not LOGIN_PASSKEYS:
+    print("[WARN] No API key / passkey configured: every request will be rejected (401).", flush=True)
+
+# id -> (backend, upstream model). "local" = Ollama on the T4 (falls back to Groq if offline),
+# "groq" = always Groq cloud. Labels state the real engine so the UI never misleads.
+MODEL_ROUTES = {
+    "qwen3.8-27b-uncensored": {"backend": "local", "ollama": "qwen3.8-27b-uncensored", "groq": "qwen/qwen3.8-27b"},
+    # GLM 5.3 / DeepSeek V4.1 are far too large for a Colab T4 (hundreds of GB) and are NOT served here.
+    # Use them in the OpenCode app (free hosted models glm-5.3-flash-free, deepseek-v4.1-flash-free).
+    "deepseek-v4.1":          {"backend": "unavailable"},
+    "glm-5.3":                {"backend": "unavailable"},
+}
+DEFAULT_MODEL = "qwen3.8-27b-uncensored"
 MODELS_LIST = [
-    {"id": "qwen3.8-27b-uncensored", "name": "Qwen 3.8 27B Uncensored (Flagship Engine)"},
-    {"id": "deepseek-v4.1", "name": "DeepSeek V4.1 (Deep Reasoning Engine)"},
-    {"id": "glm-5.3", "name": "GLM 5.3 (Complex Logic Engine)"}
+    {"id": "qwen3.8-27b-uncensored", "name": "Qwen 3.8 27B Uncensored (Local T4)"}
 ]
 
 def check_authorized(req: Request) -> bool:
     auth = req.headers.get("authorization", "")
     passkey_hdr = req.headers.get("x-passkey", "")
+    user_hdr = req.headers.get("x-user-id", "")
+
+    if user_hdr and passkey_hdr:
+        if VALID_USERS.get(user_hdr) == passkey_hdr:
+            return True
 
     for raw in [passkey_hdr, auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""]:
         if raw:
             k = raw.strip()
-            if k in LOGIN_PASSKEYS or k.startswith("sk-jaggu") or k.startswith("sk-"):
+            if k in LOGIN_PASSKEYS or k in VALID_API_KEYS:
                 return True
 
     return False
@@ -149,12 +197,19 @@ HTML_UI = """<!DOCTYPE html>
       <div class="lock-title">AgenticVerse Sovereign Gate</div>
       <div class="lock-sub">Enter Passkey or API Key to access Flagship Neural Compute session.</div>
       <div class="input-group">
-        <input type="password" id="passkey-input" class="lock-input" placeholder="Passkey (gqd@534$$) or sk-jaggu..." autocomplete="off" />
+        <input type="password" id="passkey-input" class="lock-input" placeholder="Enter Sovereign Passkey or API Key..." autocomplete="off" />
         <button type="button" id="toggle-pass-btn" class="toggle-pass" onclick="togglePassVisibility()">Show</button>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;padding:6px 2px;font-size:0.8rem;color:var(--text-muted);">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+          <input type="checkbox" id="save-info-check" checked style="cursor:pointer;" />
+          <span>Save Info on this device</span>
+        </label>
+        <span style="color:#10b981;font-size:0.75rem;">Local Session</span>
       </div>
       <button class="lock-btn" onclick="unlockGateway()">Unlock Console</button>
       <div id="lock-err" class="lock-err">Access Denied: Invalid Passkey or API Key</div>
-      <div class="key-badge">Passkey: gqd@534$$ | API: sk-jaggu...</div>
+      <div class="key-badge">Sovereign Encryption • Zero Server Storage</div>
     </div>
   </div>
 
@@ -166,8 +221,8 @@ HTML_UI = """<!DOCTYPE html>
     <div class="controls">
       <select id="model-select">
         <option value="qwen3.8-27b-uncensored">Qwen 3.8 27B Uncensored (Active)</option>
-        <option value="deepseek-v4.1">DeepSeek V4.1</option>
-        <option value="glm-5.3">GLM 5.3</option>
+        <option value="deepseek-v4.1" disabled>DeepSeek V4.1 - OpenCode app me chalao (yahan nahi)</option>
+        <option value="glm-5.3" disabled>GLM 5.3 - OpenCode app me chalao (yahan nahi)</option>
       </select>
       <div class="vram-pill" id="vram-stat">VRAM: <strong>Checking...</strong></div>
       <button class="lock-nav-btn" onclick="logout()">Lock Session</button>
@@ -203,13 +258,12 @@ HTML_UI = """<!DOCTYPE html>
     const modelSelect = document.getElementById('model-select');
     let history = [];
 
-    // Check saved session
-    const savedKey = sessionStorage.getItem('agv_auth');
+    // Check saved session from localStorage or sessionStorage
+    const savedKey = localStorage.getItem('agv_auth') || sessionStorage.getItem('agv_auth');
     if (savedKey) {
-      if (savedKey === 'gqd@534$$' || savedKey === 'gqd@534' || savedKey.startsWith('sk-') || savedKey === 'jaggu') {
-        lockModal.style.display = 'none';
-        initTelemetry();
-      }
+      fetch('/auth/verify', {method:'POST', headers:{'Authorization':'Bearer '+savedKey,'x-passkey':savedKey}})
+        .then(r => { if (r.ok) { lockModal.style.display='none'; initTelemetry(); } else { localStorage.removeItem('agv_auth'); sessionStorage.removeItem('agv_auth'); } })
+        .catch(() => {});
     }
 
     passkeyInput.addEventListener('keydown', (e) => {
@@ -251,7 +305,13 @@ HTML_UI = """<!DOCTYPE html>
           }
         });
         if (res.ok) {
+          const saveInfo = document.getElementById('save-info-check')?.checked;
           sessionStorage.setItem('agv_auth', val);
+          if (saveInfo) {
+            localStorage.setItem('agv_auth', val);
+          } else {
+            localStorage.removeItem('agv_auth');
+          }
           lockModal.style.display = 'none';
           lockErr.style.display = 'none';
           initTelemetry();
@@ -260,15 +320,8 @@ HTML_UI = """<!DOCTYPE html>
           lockErr.style.display = 'block';
         }
       } catch(e) {
-        if (val === 'gqd@534$$' || val === 'gqd@534' || val.startsWith('sk-') || val === 'jaggu') {
-          sessionStorage.setItem('agv_auth', val);
-          lockModal.style.display = 'none';
-          lockErr.style.display = 'none';
-          initTelemetry();
-        } else {
-          lockErr.innerText = 'Access Denied: Invalid Passkey';
-          lockErr.style.display = 'block';
-        }
+        lockErr.innerText = 'Gateway se connect nahi ho paya. Dobara koshish karo.';
+        lockErr.style.display = 'block';
       }
     }
 
@@ -412,24 +465,68 @@ def index_ui():
 def health():
     return {"status": "healthy", "service": "AgenticVerse Sovereign Gateway"}
 
+@app.post("/auth/login")
+async def login(req: Request):
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    uid = body.get("user_id", "").strip()
+    passkey = body.get("passkey", "").strip()
+    ok = (uid in VALID_USERS and VALID_USERS[uid] == passkey) or (passkey and passkey in LOGIN_PASSKEYS)
+    if ok:
+        return {"status": "ok", "authenticated": True, "api_key": API_KEY, "user": uid}
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid User ID or Master Passkey")
+
 @app.post("/auth/verify")
 async def verify_auth(req: Request):
     if check_authorized(req):
         return {"status": "ok", "authenticated": True}
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Passkey or API Key")
 
+GROQ_API_KEY = _S.get("groq_api_key") or os.environ.get("GROQ_API_KEY", "")
+
+def get_groq_model(model_name: str) -> str:
+    route = MODEL_ROUTES.get((model_name or "").lower())
+    if route:
+        return route["groq"]
+    return MODEL_ROUTES[DEFAULT_MODEL]["groq"]
+
+async def is_ollama_online() -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            r = await client.get("http://127.0.0.1:11434/api/tags")
+            return r.status_code == 200
+    except Exception:
+        return False
+
 @app.get("/ps")
-def process_status(req: Request):
+async def process_status(req: Request):
+    """Truthful status. engine == "ollama" only when the Qwen model is really loaded on the GPU."""
     if not check_authorized(req):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
     import subprocess
-    res_ps = subprocess.run(["ollama", "ps"], capture_output=True, text=True)
-    res_gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.used,memory.free,utilization.gpu", "--format=csv,noheader"], capture_output=True, text=True)
-    return {
-        "status": "online",
-        "gpu_telemetry": res_gpu.stdout.strip(),
-        "ollama_ps": res_ps.stdout.strip()
-    }
+    ollama_up = await is_ollama_online()
+    ps_txt, gpu = "", ""
+    if ollama_up:
+        try:
+            ps_txt = subprocess.run(["ollama", "ps"], capture_output=True, text=True, timeout=3).stdout.strip()
+        except Exception:
+            pass
+        try:
+            gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.used,memory.free,utilization.gpu", "--format=csv,noheader"], capture_output=True, text=True, timeout=3).stdout.strip()
+        except Exception:
+            pass
+    if ollama_up and DEFAULT_MODEL in ps_txt:
+        engine = "ollama"
+    elif ollama_up:
+        engine = "loading"
+    elif GROQ_API_KEY:
+        engine = "groq-fallback"
+    else:
+        engine = "none"
+    return {"status": "online" if engine == "ollama" else "degraded", "engine": engine,
+            "gpu_telemetry": gpu or "n/a", "ollama_ps": ps_txt}
 
 @app.get("/v1/models")
 @app.get("/models")
@@ -449,14 +546,41 @@ def list_models(req: Request):
         } for m in MODELS_LIST]
     }
 
-async def stream_ollama(model: str, messages: list, temperature: float = 0.6, max_tokens: int = None):
-    url = "http://127.0.0.1:11434/v1/chat/completions"
-    payload = {"model": model, "messages": messages, "stream": True, "temperature": temperature}
-    if max_tokens:
-        payload["max_tokens"] = max_tokens
+async def stream_groq(model: str, messages: list, temperature: float = 0.6, max_tokens: int = None):
+    groq_model = model  # already resolved upstream model id
+    max_tok = max_tokens if max_tokens else 8192
+    payload = {
+        "model": groq_model,
+        "messages": messages,
+        "stream": True,
+        "temperature": temperature,
+        "max_tokens": max_tok
+    }
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "AgenticVerse-Sovereign-Gateway/2.0"
+    }
 
     try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            async with client.stream("POST", "https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload) as response:
+                async for chunk in response.aiter_lines():
+                    if chunk:
+                        yield f"{chunk}\n\n"
+    except Exception as e:
+        err = {"error": {"message": f"Cloud Sovereign error: {str(e)}", "type": "gateway_error"}}
+        yield f"data: {json.dumps(err)}\n\n"
+        yield "data: [DONE]\n\n"
+
+async def stream_ollama(model: str, messages: list, temperature: float = 0.6, max_tokens: int = None):
+    # Check if local Ollama is active; if not, stream directly from Groq without failing!
+    url = "http://127.0.0.1:11434/v1/chat/completions"
+    max_tok = max_tokens if max_tokens else 8192
+    payload = {"model": model, "messages": messages, "stream": True, "temperature": temperature, "max_tokens": max_tok}
+
+    try:
+        async with httpx.AsyncClient(timeout=1200.0) as client:
             async with client.stream("POST", url, json=payload) as response:
                 async for chunk in response.aiter_lines():
                     if chunk:
@@ -474,9 +598,25 @@ async def stream_ollama(model: str, messages: list, temperature: float = 0.6, ma
                                 pass
                         yield f"{chunk}\n\n"
     except Exception as e:
-        err = {"error": {"message": str(e), "type": "gateway_error"}}
-        yield f"data: {json.dumps(err)}\n\n"
-        yield "data: [DONE]\n\n"
+        # Ollama failed before/while streaming; fall back to the Groq twin of this model
+        async for chunk in stream_groq(get_groq_model(DEFAULT_MODEL), messages, temperature, max_tokens):
+            yield chunk
+
+async def resolve_route(model: str):
+    """Return (backend, upstream_model). Unknown model ids raise 404 instead of silently remapping."""
+    key = (model or DEFAULT_MODEL).lower()
+    if key == "default":
+        key = DEFAULT_MODEL
+    route = MODEL_ROUTES.get(key)
+    if not route:
+        raise HTTPException(status_code=404, detail=f"Model '{model}' not found. Available: {', '.join(MODEL_ROUTES)}")
+    if route["backend"] == "unavailable":
+        raise HTTPException(status_code=400, detail=f"'{model}' is not served by this gateway (too large for a Colab T4). This gateway serves only qwen3.8-27b-uncensored. Use GLM 5.3 / DeepSeek V4.1 via the OpenCode app (free models: glm-5.3-flash-free, deepseek-v4.1-flash-free).")
+    if route["backend"] == "local" and await is_ollama_online():
+        return "ollama", route["ollama"]
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=503, detail="Qwen is not loaded on the GPU right now and no Groq fallback is configured. Restart the Colab shift (see RESTART_GUIDE.md).")
+    return "groq", route["groq"]
 
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
@@ -489,30 +629,52 @@ async def completions(req: Request):
     except Exception:
         body = {}
 
-    model = body.get("model", "qwen3.8-27b-uncensored")
+    model = body.get("model") or DEFAULT_MODEL
+    backend, upstream = await resolve_route(model)
     messages = body.get("messages", [])
-    stream = body.get("stream", True)
+    stream = bool(body.get("stream", False))  # OpenAI default is non-streaming
     temp = float(body.get("temperature", 0.6))
     max_tok = body.get("max_tokens")
+    served = {"X-Served-By": f"{backend}:{upstream}", "X-Requested-Model": str(model)}
+
+    if backend == "groq" and not GROQ_API_KEY:
+        raise HTTPException(status_code=503, detail="Cloud backend not configured (GROQ_API_KEY missing)")
 
     if stream:
+        gen = (stream_ollama if backend == "ollama" else stream_groq)(upstream, messages, temp, max_tok)
         return StreamingResponse(
-            stream_ollama(model=model, messages=messages, temperature=temp, max_tokens=max_tok),
+            gen,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"
+                "X-Accel-Buffering": "no",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                **served
             }
         )
-    else:
-        url = "http://127.0.0.1:11434/v1/chat/completions"
-        payload = {"model": model, "messages": messages, "stream": False, "temperature": temp}
-        if max_tok:
-            payload["max_tokens"] = max_tok
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            r = await client.post(url, json=payload)
-            return JSONResponse(r.json())
+
+    payload = {"model": upstream, "messages": messages, "stream": False, "temperature": temp, "max_tokens": max_tok or 8192}
+    if backend == "ollama":
+        try:
+            async with httpx.AsyncClient(timeout=1200.0) as client:
+                r = await client.post("http://127.0.0.1:11434/v1/chat/completions", json=payload)
+                if r.status_code == 200:
+                    return JSONResponse(r.json(), headers=served)
+        except Exception:
+            pass
+        if not GROQ_API_KEY:
+            raise HTTPException(status_code=502, detail="Local engine failed and no cloud fallback configured")
+        upstream = get_groq_model(DEFAULT_MODEL)
+        payload["model"] = upstream
+        served["X-Served-By"] = f"groq-fallback:{upstream}"
+
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        r = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+        return JSONResponse(r.json(), status_code=r.status_code, headers=served)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

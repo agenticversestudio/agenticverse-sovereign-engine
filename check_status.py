@@ -11,8 +11,20 @@ if hasattr(sys.stderr, "reconfigure"):
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
-HEALTH_URL = "https://eel-feminine-progeny.ngrok-free.dev/v1/models"
-API_KEY = "sk-jaggu"
+def _load_dotenv(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+    except FileNotFoundError:
+        pass
+
+_load_dotenv(os.path.join(BASE_DIR, ".env"))
+HEALTH_URL = f"https://{os.environ.get('NGROK_DOMAIN', '')}/v1/models"
+API_KEY = os.environ.get("AGENTIC_API_KEY", "")
 
 def print_status():
     state = {}

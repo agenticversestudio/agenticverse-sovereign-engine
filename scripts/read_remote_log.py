@@ -1,6 +1,7 @@
 import os
 
 log_files = [
+    ("/content/create.log", "CREATE LOG"),
     ("/content/payload.log", "PAYLOAD PROGRESS"),
     ("/content/ngrok.log", "NGROK LOG"),
     ("/content/server_stdout.log", "HYBRID SERVER LOG"),
@@ -13,7 +14,8 @@ for path, title in log_files:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 lines = f.readlines()
                 last_lines = "".join(lines[-8:]).strip()
+                clean_lines = last_lines.encode("ascii", "ignore").decode("ascii")
                 print(f"--- {title} ---")
-                print(last_lines)
+                print(clean_lines)
         except Exception:
             pass
