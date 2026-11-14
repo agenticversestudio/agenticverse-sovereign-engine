@@ -1,21 +1,49 @@
-# Python & Bytecode
+# Environment & Secrets
+.env
+.env.local
+*.env
+token.json
+tokens/
+vault/
+colab_vault/
+*.key
+*.pem
+*.secret
+*SECRETS*
+*secrets*
+secrets.json
+_container_secrets.json
+*.bak
+*.orig
+
+# Logs & Runtime State
+logs/
+*.log
+state.json
+*.pid
 __pycache__/
 *.py[cod]
 *$py.class
-*.log
+.pytest_cache/
 
-# Sensitive Vault & Local Secrets (DO NOT COMMIT RAW TO PUBLIC GIT)
-vault/
-*.env
-.env.cloud_template
-render_manager.py
-deploy_*.py
+# Large Model Files
+*.gguf
+*.bin
+*.pt
+*.safetensors
+*.onnx
 
-# Local State & Temp
-state.json
-logs/
-_secrets.json
-.env
-*.orig.bak
-*.orig.py
-make_env.py
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node / WebUI build
+node_modules/
+dist/
+.vercel
+
+brag-output/

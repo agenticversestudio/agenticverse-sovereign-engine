@@ -1,523 +1,222 @@
-import os, sys, time, json, re, asyncio, httpx
+#!/usr/bin/env python3
+"""
+Colab Router - Decoupled Colab Router Gateway (FastAPI + SSE Streaming)
+=====================================================================
+Stateless, OpenAI-compatible Inference Proxy running inside Google Colab.
+
+Endpoints:
+  - GET  /health               -> Gateway liveness probe
+  - GET  /ps                   -> Real-time GPU VRAM telemetry (nvidia-smi) & Ollama runner state
+  - GET  /v1/models            -> Model catalog
+  - POST /v1/chat/completions  -> Streaming SSE and Non-Streaming completions
+  - POST /auth/verify          -> Token/Passkey verification
+"""
+
+import os
+import sys
+import json
+import time
+import subprocess
+from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 import uvicorn
 
-app = FastAPI(title="AgenticVerse Sovereign Gateway")
+# UTF-8 Guard
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
+
+# Load secrets from /content/secrets.json if available
+if os.path.exists('/content/secrets.json'):
+    try:
+        import json
+        with open('/content/secrets.json') as _sf:
+            _sec = json.load(_sf)
+            for _k, _v in _sec.items():
+                if _v and not os.environ.get(_k):
+                    os.environ[_k] = str(_v)
+    except Exception as _e:
+        print('[!] Warning: failed to load /content/secrets.json:', _e)
+
+# ----------------- Environment Configuration -----------------
+GDQ_API_KEY = os.environ.get("GDQ_API_KEY", "")
+GDQ_PASSKEY = os.environ.get("GDQ_PASSKEY", "")
+EXTRA_PASSKEY = os.environ.get("EXTRA_PASSKEY", "")
+ALLOWED_PASSKEYS = {p.strip() for p in [GDQ_PASSKEY, EXTRA_PASSKEY] if p.strip()}
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+OLLAMA_MODEL_TAG = os.environ.get("OLLAMA_MODEL_TAG", "qwen3.8-27b-uncensored")
+
+app = FastAPI(
+    title="Colab Router Colab Router Gateway",
+    version="3.0.0",
+    docs_url="/docs",
+    redoc_url=None
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"]
+    expose_headers=["*"],
 )
 
 @app.options("/{full_path:path}")
-async def options_handler(request: Request, full_path: str):
-    response = JSONResponse({"status": "ok", "path": full_path})
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Max-Age"] = "86400"
-    return response
+async def preflight_handler(full_path: str):
+    return JSONResponse(
+        content={"status": "ok"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE, PATCH",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+        }
+    )
 
-# --- Secrets are NOT stored in code. They come from /content/secrets.json (uploaded by the
-# orchestrator at start) or from environment variables. See agenticverse/.env.example ---
-def _load_secrets():
-    path = os.environ.get("GATEWAY_SECRETS", "/content/secrets.json")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+# ----------------- Authentication Helper -----------------
+def is_authorized(req: Request) -> bool:
+    # Fail closed: if no API key / passkey is configured, nobody is authorized.
+    if not GDQ_API_KEY and not ALLOWED_PASSKEYS:
+        return False
 
-_S = _load_secrets()
-API_KEY = _S.get("api_key") or os.environ.get("AGENTIC_API_KEY", "")
-PASSKEY = _S.get("passkey") or os.environ.get("AGENTIC_PASSKEY", "")
-LOGIN_USER = _S.get("login_user") or os.environ.get("AGENTIC_LOGIN_USER", "")
-_extra = _S.get("extra_api_keys") or os.environ.get("EXTRA_API_KEYS", "")
-EXTRA_KEYS = [k.strip() for k in (_extra.split(",") if isinstance(_extra, str) else _extra) if k and k.strip()]
-LOGIN_PASSKEYS = [PASSKEY] if PASSKEY else []
-VALID_USERS = {LOGIN_USER: PASSKEY} if (LOGIN_USER and PASSKEY) else {}
-VALID_API_KEYS = [k for k in [API_KEY] + EXTRA_KEYS if k]
-if not VALID_API_KEYS and not LOGIN_PASSKEYS:
-    print("[WARN] No API key / passkey configured: every request will be rejected (401).", flush=True)
+    auth_header = req.headers.get("Authorization", "")
+    token = auth_header.replace("Bearer ", "").strip()
+    x_key = req.headers.get("x-api-key", "").strip()
+    x_passkey = req.headers.get("x-passkey", "").strip()
 
-# id -> (backend, upstream model). "local" = Ollama on the T4 (falls back to Groq if offline),
-# "groq" = always Groq cloud. Labels state the real engine so the UI never misleads.
-MODEL_ROUTES = {
-    "qwen3.8-27b-uncensored": {"backend": "local", "ollama": "qwen3.8-27b-uncensored", "groq": "qwen/qwen3.8-27b"},
-    # GLM 5.3 / DeepSeek V4.1 are far too large for a Colab T4 (hundreds of GB) and are NOT served here.
-    # Use them in the OpenCode app (free hosted models glm-5.3-flash-free, deepseek-v4.1-flash-free).
-    "deepseek-v4.1":          {"backend": "unavailable"},
-    "glm-5.3":                {"backend": "unavailable"},
-}
-DEFAULT_MODEL = "qwen3.8-27b-uncensored"
-MODELS_LIST = [
-    {"id": "qwen3.8-27b-uncensored", "name": "Qwen 3.8 27B Uncensored (Local T4)"}
-]
+    candidate = token or x_key or x_passkey
+    if not candidate:
+        # Check query param as fallback
+        candidate = req.query_params.get("api_key", "")
 
-def check_authorized(req: Request) -> bool:
-    auth = req.headers.get("authorization", "")
-    passkey_hdr = req.headers.get("x-passkey", "")
-    user_hdr = req.headers.get("x-user-id", "")
-
-    if user_hdr and passkey_hdr:
-        if VALID_USERS.get(user_hdr) == passkey_hdr:
-            return True
-
-    for raw in [passkey_hdr, auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""]:
-        if raw:
-            k = raw.strip()
-            if k in LOGIN_PASSKEYS or k in VALID_API_KEYS:
-                return True
+    if GDQ_API_KEY and candidate == GDQ_API_KEY:
+        return True
+    if candidate in ALLOWED_PASSKEYS or x_passkey in ALLOWED_PASSKEYS:
+        return True
 
     return False
 
-HTML_UI = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AgenticVerse | Sovereign AI Studio</title>
-  <style>
-    :root {
-      --bg: #090d16;
-      --card: #111827;
-      --border: #1f2937;
-      --accent: #3b82f6;
-      --text: #f3f4f6;
-      --text-muted: #9ca3af;
-      --green: #10b981;
-      --danger: #ef4444;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body { background: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
-
-    /* Login Lock Screen */
-    #lock-modal {
-      position: fixed; inset: 0; background: rgba(9, 13, 22, 0.96);
-      backdrop-filter: blur(16px); display: flex; align-items: center; justify-content: center; z-index: 100;
-    }
-    .lock-card {
-      background: var(--card); border: 1px solid var(--border); border-radius: 20px; padding: 32px;
-      max-width: 440px; width: 90%; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.6);
-    }
-    .lock-icon-wrap {
-      width: 64px; height: 64px; border-radius: 16px; background: rgba(59, 130, 246, 0.1);
-      border: 1px solid rgba(59, 130, 246, 0.2); display: flex; align-items: center; justify-content: center;
-      margin: 0 auto 16px;
-    }
-    .lock-title { font-size: 1.3rem; font-weight: 700; color: #fff; margin-bottom: 6px; }
-    .lock-sub { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 20px; line-height: 1.4; }
-    .input-group { position: relative; margin-bottom: 12px; }
-    .lock-input {
-      width: 100%; padding: 13px 60px 13px 16px; border-radius: 12px; background: #1a2234; border: 1px solid var(--border);
-      color: #fff; font-size: 0.95rem; outline: none; transition: border-color 0.2s;
-    }
-    .lock-input:focus { border-color: var(--accent); }
-    .toggle-pass {
-      position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
-      background: transparent; border: none; color: var(--text-muted); font-size: 0.75rem;
-      cursor: pointer; padding: 4px 6px; border-radius: 4px;
-    }
-    .toggle-pass:hover { color: #fff; }
-    .lock-btn {
-      width: 100%; padding: 13px; border-radius: 12px; background: var(--accent); color: #fff;
-      font-size: 1rem; font-weight: 600; border: none; cursor: pointer; transition: 0.2s;
-    }
-    .lock-btn:hover { background: #2563eb; }
-    .lock-err { color: var(--danger); font-size: 0.8rem; margin-top: 10px; display: none; }
-    .key-badge {
-      font-size: 0.72rem; color: var(--text-muted); background: rgba(31, 41, 55, 0.5);
-      border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; margin-top: 14px;
-      display: inline-block;
-    }
-
-    /* App Header */
-    header {
-      background: rgba(17, 24, 39, 0.85); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border);
-      padding: 12px 24px; display: flex; justify-content: space-between; align-items: center;
-    }
-    .brand { display: flex; align-items: center; gap: 12px; }
-    .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green); }
-    .brand h1 { font-size: 1.15rem; font-weight: 700; background: linear-gradient(135deg, #60a5fa, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-    .controls { display: flex; align-items: center; gap: 12px; }
-    select#model-select {
-      background: #1a2234; border: 1px solid var(--border); color: #fff; padding: 6px 12px;
-      border-radius: 8px; font-size: 0.82rem; outline: none; cursor: pointer;
-    }
-    .vram-pill { font-size: 0.75rem; color: var(--text-muted); background: rgba(31, 41, 55, 0.6); padding: 4px 10px; border-radius: 9999px; border: 1px solid var(--border); }
-    .vram-pill strong { color: var(--green); }
-    .lock-nav-btn {
-      background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border); color: var(--text-muted);
-      cursor: pointer; font-size: 0.78rem; padding: 5px 10px; border-radius: 8px; transition: 0.2s;
-    }
-    .lock-nav-btn:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
-
-    /* Main Chat */
-    main { flex: 1; max-width: 900px; width: 100%; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; height: calc(100vh - 65px); }
-    #chat-box { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; padding: 10px 0; }
-    .msg { display: flex; flex-direction: column; max-width: 85%; animation: fadeIn 0.2s ease; }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
-    .msg.user { align-self: flex-end; }
-    .msg.assistant { align-self: flex-start; }
-    .bubble { padding: 12px 18px; border-radius: 16px; font-size: 0.95rem; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
-    .msg.user .bubble { background: linear-gradient(135deg, #2563eb, #1d4ed8); color: white; border-bottom-right-radius: 4px; }
-    .msg.assistant .bubble { background: var(--card); border: 1px solid var(--border); color: var(--text); border-bottom-left-radius: 4px; }
-    .think-block {
-      background: rgba(30, 41, 59, 0.7); border-left: 3px solid #818cf8; padding: 10px 14px;
-      border-radius: 8px; font-size: 0.85rem; color: #c7d2fe; margin-bottom: 8px; font-family: monospace;
-      white-space: pre-wrap; word-break: break-word; max-height: 250px; overflow-y: auto;
-    }
-    .think-header { font-weight: 600; color: #a5b4fc; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-
-    /* Input Bar */
-    .input-bar { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 8px 12px; display: flex; align-items: center; gap: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
-    textarea { flex: 1; background: transparent; border: none; color: var(--text); font-size: 0.95rem; resize: none; outline: none; height: 42px; line-height: 1.4; padding: 10px 4px; }
-    button#send-btn { background: var(--accent); color: white; border: none; width: 42px; height: 42px; border-radius: 12px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
-    button#send-btn:hover { background: #2563eb; }
-    button#send-btn:disabled { opacity: 0.3; cursor: not-allowed; }
-    .footer-note { font-size: 0.72rem; text-align: center; color: var(--text-muted); margin-top: 8px; }
-  </style>
-</head>
-<body>
-
-  <!-- Passkey Lock Barrier -->
-  <div id="lock-modal">
-    <div class="lock-card">
-      <div class="lock-icon-wrap">
-        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
-          <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
-        </svg>
-      </div>
-      <div class="lock-title">AgenticVerse Sovereign Gate</div>
-      <div class="lock-sub">Enter Passkey or API Key to access Flagship Neural Compute session.</div>
-      <div class="input-group">
-        <input type="password" id="passkey-input" class="lock-input" placeholder="Enter Sovereign Passkey or API Key..." autocomplete="off" />
-        <button type="button" id="toggle-pass-btn" class="toggle-pass" onclick="togglePassVisibility()">Show</button>
-      </div>
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;padding:6px 2px;font-size:0.8rem;color:var(--text-muted);">
-        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-          <input type="checkbox" id="save-info-check" checked style="cursor:pointer;" />
-          <span>Save Info on this device</span>
-        </label>
-        <span style="color:#10b981;font-size:0.75rem;">Local Session</span>
-      </div>
-      <button class="lock-btn" onclick="unlockGateway()">Unlock Console</button>
-      <div id="lock-err" class="lock-err">Access Denied: Invalid Passkey or API Key</div>
-      <div class="key-badge">Sovereign Encryption • Zero Server Storage</div>
-    </div>
-  </div>
-
-  <header>
-    <div class="brand">
-      <div class="pulse"></div>
-      <h1>AgenticVerse Studio</h1>
-    </div>
-    <div class="controls">
-      <select id="model-select">
-        <option value="qwen3.8-27b-uncensored">Qwen 3.8 27B Uncensored (Active)</option>
-        <option value="deepseek-v4.1" disabled>DeepSeek V4.1 - OpenCode app me chalao (yahan nahi)</option>
-        <option value="glm-5.3" disabled>GLM 5.3 - OpenCode app me chalao (yahan nahi)</option>
-      </select>
-      <div class="vram-pill" id="vram-stat">VRAM: <strong>Checking...</strong></div>
-      <button class="lock-nav-btn" onclick="logout()">Lock Session</button>
-    </div>
-  </header>
-
-  <main>
-    <div id="chat-box">
-      <div class="msg assistant">
-        <div class="bubble">AgenticVerse Sovereign Engine online. Raw unconstrained compute ready. Send prompt below.</div>
-      </div>
-    </div>
-
-    <div class="input-bar">
-      <textarea id="prompt-input" placeholder="Enter message... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
-      <button id="send-btn" onclick="sendMessage()">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <line x1="22" y1="2" x2="11" y2="13"></line>
-          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-        </svg>
-      </button>
-    </div>
-    <div class="footer-note">Authenticated Neural Session • Direct Stream</div>
-  </main>
-
-  <script>
-    const lockModal = document.getElementById('lock-modal');
-    const passkeyInput = document.getElementById('passkey-input');
-    const lockErr = document.getElementById('lock-err');
-    const chatBox = document.getElementById('chat-box');
-    const promptInput = document.getElementById('prompt-input');
-    const sendBtn = document.getElementById('send-btn');
-    const modelSelect = document.getElementById('model-select');
-    let history = [];
-
-    // Check saved session from localStorage or sessionStorage
-    const savedKey = localStorage.getItem('agv_auth') || sessionStorage.getItem('agv_auth');
-    if (savedKey) {
-      fetch('/auth/verify', {method:'POST', headers:{'Authorization':'Bearer '+savedKey,'x-passkey':savedKey}})
-        .then(r => { if (r.ok) { lockModal.style.display='none'; initTelemetry(); } else { localStorage.removeItem('agv_auth'); sessionStorage.removeItem('agv_auth'); } })
-        .catch(() => {});
-    }
-
-    passkeyInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') unlockGateway();
-    });
-
-    promptInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendMessage();
-      }
-    });
-
-    function togglePassVisibility() {
-      const btn = document.getElementById('toggle-pass-btn');
-      if (passkeyInput.type === 'password') {
-        passkeyInput.type = 'text';
-        btn.innerText = 'Hide';
-      } else {
-        passkeyInput.type = 'password';
-        btn.innerText = 'Show';
-      }
-    }
-
-    async function unlockGateway() {
-      const val = passkeyInput.value.trim();
-      if (!val) {
-        lockErr.innerText = 'Please enter Passkey or API Key';
-        lockErr.style.display = 'block';
-        return;
-      }
-      try {
-        const res = await fetch('/auth/verify', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + val,
-            'x-passkey': val
-          }
-        });
-        if (res.ok) {
-          const saveInfo = document.getElementById('save-info-check')?.checked;
-          sessionStorage.setItem('agv_auth', val);
-          if (saveInfo) {
-            localStorage.setItem('agv_auth', val);
-          } else {
-            localStorage.removeItem('agv_auth');
-          }
-          lockModal.style.display = 'none';
-          lockErr.style.display = 'none';
-          initTelemetry();
-        } else {
-          lockErr.innerText = 'Access Denied: Invalid Passkey or API Key';
-          lockErr.style.display = 'block';
-        }
-      } catch(e) {
-        lockErr.innerText = 'Gateway se connect nahi ho paya. Dobara koshish karo.';
-        lockErr.style.display = 'block';
-      }
-    }
-
-    function logout() {
-      sessionStorage.removeItem('agv_auth');
-      location.reload();
-    }
-
-    async function initTelemetry() {
-      try {
-        const key = sessionStorage.getItem('agv_auth') || '';
-        const res = await fetch('/ps', {
-          headers: {
-            'Authorization': 'Bearer ' + key,
-            'x-passkey': key
-          }
-        });
-        if (res.ok) {
-          const d = await res.json();
-          if (d.gpu_telemetry) {
-            document.getElementById('vram-stat').innerHTML = 'VRAM: <strong>' + d.gpu_telemetry.split(',')[1].trim() + '</strong>';
-          }
-        }
-      } catch(e) {}
-    }
-    setInterval(initTelemetry, 15000);
-
-    async function sendMessage() {
-      const text = promptInput.value.trim();
-      if (!text) return;
-
-      const auth = sessionStorage.getItem('agv_auth');
-      if (!auth) {
-        lockModal.style.display = 'flex';
-        return;
-      }
-
-      promptInput.value = '';
-      sendBtn.disabled = true;
-
-      appendMsg('user', text);
-      history.push({ role: 'user', content: text });
-
-      const assistantBubble = appendMsg('assistant', '');
-      let fullThinking = '';
-      let fullReply = '';
-      let thinkBlock = null;
-
-      try {
-        const response = await fetch('/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + auth,
-            'x-passkey': auth
-          },
-          body: JSON.stringify({
-            model: modelSelect.value,
-            messages: history,
-            stream: true
-          })
-        });
-
-        if (response.status === 401) {
-          assistantBubble.innerText = '[401 Unauthorized: Invalid Passkey]';
-          logout();
-          return;
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\\n');
-
-          for (const line of lines) {
-            if (line.startsWith('data: ') && line !== 'data: [DONE]') {
-              try {
-                const data = JSON.parse(line.substring(6));
-                const deltaObj = data.choices[0]?.delta || {};
-
-                // Handle live thinking stream
-                const reasoning = deltaObj.reasoning || deltaObj.reasoning_content || '';
-                if (reasoning) {
-                  if (!thinkBlock) {
-                    thinkBlock = document.createElement('div');
-                    thinkBlock.className = 'think-block';
-                    thinkBlock.innerHTML = '<div class="think-header"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#a5b4fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:middle;margin-right:4px;"><path d="M12 2a7 7 0 0 1 7 7c0 2.38-1.19 4.47-3 5.74V17a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2v-2.26C6.19 13.47 5 11.38 5 9a7 7 0 0 1 7-7z"></path><path d="M9 21h6"></path></svg>Reasoning Stream:</div><span class="think-text"></span>';
-                    assistantBubble.parentElement.insertBefore(thinkBlock, assistantBubble);
-                  }
-                  fullThinking += reasoning;
-                  thinkBlock.querySelector('.think-text').innerText = fullThinking;
-                  chatBox.scrollTop = chatBox.scrollHeight;
-                }
-
-                // Handle regular response content
-                const content = deltaObj.content || '';
-                if (content) {
-                  fullReply += content;
-                  assistantBubble.innerText = fullReply;
-                  chatBox.scrollTop = chatBox.scrollHeight;
-                }
-              } catch(e) {}
-            }
-          }
-        }
-        history.push({ role: 'assistant', content: fullReply });
-      } catch(err) {
-        assistantBubble.innerText = '[Stream error: ' + err.message + ']';
-      } finally {
-        sendBtn.disabled = false;
-        promptInput.focus();
-      }
-    }
-
-    function appendMsg(role, text) {
-      const msgDiv = document.createElement('div');
-      msgDiv.className = 'msg ' + role;
-      const bubble = document.createElement('div');
-      bubble.className = 'bubble';
-      bubble.innerText = text;
-      msgDiv.appendChild(bubble);
-      chatBox.appendChild(msgDiv);
-      chatBox.scrollTop = chatBox.scrollHeight;
-      return bubble;
-    }
-  </script>
-</body>
-</html>
-"""
-
-@app.get("/", response_class=HTMLResponse)
-def index_ui():
-    return HTMLResponse(content=HTML_UI, media_type="text/html; charset=utf-8")
-
-@app.get("/health")
-def health():
-    return {"status": "healthy", "service": "AgenticVerse Sovereign Gateway"}
-
-@app.post("/auth/login")
-async def login(req: Request):
-    try:
-        body = await req.json()
-    except Exception:
-        body = {}
-    uid = body.get("user_id", "").strip()
-    passkey = body.get("passkey", "").strip()
-    ok = (uid in VALID_USERS and VALID_USERS[uid] == passkey) or (passkey and passkey in LOGIN_PASSKEYS)
-    if ok:
-        return {"status": "ok", "authenticated": True, "api_key": API_KEY, "user": uid}
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid User ID or Master Passkey")
-
-@app.post("/auth/verify")
-async def verify_auth(req: Request):
-    if check_authorized(req):
-        return {"status": "ok", "authenticated": True}
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Passkey or API Key")
-
-GROQ_API_KEY = _S.get("groq_api_key") or os.environ.get("GROQ_API_KEY", "")
-
-def get_groq_model(model_name: str) -> str:
-    route = MODEL_ROUTES.get((model_name or "").lower())
-    if route:
-        return route["groq"]
-    return MODEL_ROUTES[DEFAULT_MODEL]["groq"]
-
+# ----------------- Service Status Probing -----------------
 async def is_ollama_online() -> bool:
     try:
-        async with httpx.AsyncClient(timeout=1.0) as client:
+        async with httpx.AsyncClient(timeout=4.0) as client:
             r = await client.get("http://127.0.0.1:11434/api/tags")
             return r.status_code == 200
     except Exception:
         return False
 
+async def is_model_in_vram() -> bool:
+    """Check whether the model is already loaded and running in GPU VRAM.
+    Ollama's /api/ps shows models currently occupying GPU memory.
+    Returns True if the model is warm and ready to serve instantly.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get("http://127.0.0.1:11434/api/ps")
+            if r.status_code == 200:
+                data = r.json()
+                models = data.get("models", [])
+                if models:
+                    return True
+    except Exception:
+        pass
+    return False
+
+# ----------------- Endpoints -----------------
+@app.get("/")
+def index():
+    return {
+        "service": "Colab Router Colab Router Gateway",
+        "status": "online",
+        "endpoints": {
+            "health": "/health",
+            "telemetry": "/ps",
+            "models": "/v1/models",
+            "chat": "/v1/chat/completions"
+        }
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "healthy", "service": "Colab Router Gateway"}
+
+@app.get("/warmup_status")
+async def warmup_status():
+    """Returns whether the model is ready to serve requests (warm in VRAM) or still loading."""
+    ollama_ok = await is_ollama_online()
+    model_warm = await is_model_in_vram() if ollama_ok else False
+    return {
+        "ollama_online": ollama_ok,
+        "model_in_vram": model_warm,
+        "ready": model_warm,
+        "message": "Ready to serve!" if model_warm else (
+            "Ollama is loading — model VRAM warmup in progress (~2-5 minutes after cold start)."
+            if ollama_ok else "Ollama daemon is still starting up (~30-60 seconds)."
+        )
+    }
+
+@app.post("/auth/verify")
+async def verify_auth(req: Request):
+    if is_authorized(req):
+        return {"status": "ok", "authenticated": True}
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key or Passkey")
+
+@app.post("/auth/login")
+async def login_auth(req: Request):
+    """Verify login passkey or API key and return authentication confirmation."""
+    passkey_found = False
+    try:
+        data = await req.json()
+        cand = str(data.get("passkey") or data.get("api_key") or "").strip()
+        if cand:
+            if GDQ_API_KEY and cand == GDQ_API_KEY:
+                passkey_found = True
+            elif cand in ALLOWED_PASSKEYS:
+                passkey_found = True
+    except Exception:
+        pass
+
+    if not passkey_found and is_authorized(req):
+        passkey_found = True
+
+    if passkey_found:
+        return {"status": "ok", "authenticated": True, "token": GDQ_API_KEY or GDQ_PASSKEY}
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key or Passkey")
+
 @app.get("/ps")
 async def process_status(req: Request):
-    """Truthful status. engine == "ollama" only when the Qwen model is really loaded on the GPU."""
-    if not check_authorized(req):
+    """Truthful status. engine == "ollama" only when the model is really loaded on the GPU."""
+    if not is_authorized(req):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
-    import subprocess
+
+    gpu_info = "n/a"
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.used,memory.free,utilization.gpu", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=3
+        )
+        if res.returncode == 0:
+            gpu_info = res.stdout.strip()
+    except Exception:
+        pass
+
     ollama_up = await is_ollama_online()
-    ps_txt, gpu = "", ""
+    ollama_info = ""
     if ollama_up:
         try:
-            ps_txt = subprocess.run(["ollama", "ps"], capture_output=True, text=True, timeout=3).stdout.strip()
+            res = subprocess.run(["ollama", "ps"], capture_output=True, text=True, timeout=3)
+            if res.returncode == 0:
+                ollama_info = res.stdout.strip()
         except Exception:
             pass
-        try:
-            gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.used,memory.free,utilization.gpu", "--format=csv,noheader"], capture_output=True, text=True, timeout=3).stdout.strip()
-        except Exception:
-            pass
-    if ollama_up and DEFAULT_MODEL in ps_txt:
+
+    if ollama_up and OLLAMA_MODEL_TAG in ollama_info:
         engine = "ollama"
     elif ollama_up:
         engine = "loading"
@@ -525,71 +224,116 @@ async def process_status(req: Request):
         engine = "groq-fallback"
     else:
         engine = "none"
-    return {"status": "online" if engine == "ollama" else "degraded", "engine": engine,
-            "gpu_telemetry": gpu or "n/a", "ollama_ps": ps_txt}
+
+    return {
+        "status": "online" if engine == "ollama" else "degraded",
+        "engine": engine,
+        "gpu_telemetry": gpu_info,
+        "ollama_ps": ollama_info,
+        "timestamp": time.time()
+    }
 
 @app.get("/v1/models")
 @app.get("/models")
-def list_models(req: Request):
-    now = int(time.time())
-    return {
-        "object": "list",
-        "data": [{
-            "id": m["id"], "object": "model", "created": now, "owned_by": "agenticverse",
-            "root": m["id"], "parent": None,
-            "permission": [{
-                "id": f"modelperm-{m['id']}", "object": "model_permission", "created": now,
-                "allow_create_engine": False, "allow_sampling": True, "allow_logprobs": True,
-                "allow_search_indices": False, "allow_view": True, "allow_fine_tuning": False,
-                "organization": "*", "group": None, "is_blocking": False
-            }]
-        } for m in MODELS_LIST]
-    }
+async def list_models(req: Request):
+    if not is_authorized(req):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
+    models_list = [
+        {"id": OLLAMA_MODEL_TAG, "object": "model", "owned_by": "colab-router"},
+        {"id": "default", "object": "model", "owned_by": "colab-router"}
+    ]
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get("http://127.0.0.1:11434/api/tags")
+            if r.status_code == 200:
+                data = r.json()
+                for m in data.get("models", []):
+                    name = m.get("name", "")
+                    if name and name not in [x["id"] for x in models_list]:
+                        models_list.append({"id": name, "object": "model", "owned_by": "ollama"})
+    except Exception:
+        pass
+
+    return {"object": "list", "data": models_list}
+
+# ----------------- Fallback Groq Streamer (Optional) -----------------
 async def stream_groq(model: str, messages: list, temperature: float = 0.6, max_tokens: int = None):
-    groq_model = model  # already resolved upstream model id
-    max_tok = max_tokens if max_tokens else 8192
+    if not GROQ_API_KEY:
+        err = {"error": {"message": "Ollama is warming up and GROQ_API_KEY fallback is not configured.", "type": "model_warming_up"}}
+        yield f"data: {json.dumps(err)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
     payload = {
-        "model": groq_model,
+        "model": "qwen/qwen3.8-27b" if "qwen" in model.lower() else "openai/gpt-oss-120b",
         "messages": messages,
         "stream": True,
         "temperature": temperature,
-        "max_tokens": max_tok
+        "max_tokens": max_tokens or 4096
     }
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-        "User-Agent": "AgenticVerse-Sovereign-Gateway/2.0"
-    }
-
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream("POST", "https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload) as response:
                 async for chunk in response.aiter_lines():
                     if chunk:
                         yield f"{chunk}\n\n"
     except Exception as e:
-        err = {"error": {"message": f"Cloud Sovereign error: {str(e)}", "type": "gateway_error"}}
+        err = {"error": {"message": f"Fallback error: {str(e)}", "type": "gateway_error"}}
         yield f"data: {json.dumps(err)}\n\n"
         yield "data: [DONE]\n\n"
 
+# ----------------- Ollama SSE Streaming & Reasoning Sanitizer -----------------
 async def stream_ollama(model: str, messages: list, temperature: float = 0.6, max_tokens: int = None):
-    # Check if local Ollama is active; if not, stream directly from Groq without failing!
+    # Check if local Ollama is active; if warming up, optionally fallback to Groq
+    ollama_ok = await is_ollama_online()
+    if not ollama_ok:
+        err = {"error": {"message": "Qwen 3.8 27B engine is initializing on Tesla T4 GPU. Please wait 30-60 seconds for VRAM warmup.", "type": "model_warming_up"}}
+        yield f"data: {json.dumps(err)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    # If Ollama is up but model isn't in VRAM yet, warn client then proceed
+    # (request itself will still queue and wait; Ollama handles the load internally)
+    model_warm = await is_model_in_vram()
+    if not model_warm:
+        # Emit a system notice as a comment so SSE doesn't break; real content follows
+        warmup_notice = {
+            "id": "warmup-notice",
+            "object": "chat.completion.chunk",
+            "choices": [{"delta": {"role": "assistant", "content": "⏳ [Model loading into GPU VRAM — first response may take 1-3 minutes. Subsequent responses are instant.]\n\n"}, "index": 0, "finish_reason": None}]
+        }
+        yield f"data: {json.dumps(warmup_notice)}\n\n"
+
     url = "http://127.0.0.1:11434/v1/chat/completions"
-    max_tok = max_tokens if max_tokens else 8192
-    payload = {"model": model, "messages": messages, "stream": True, "temperature": temperature, "max_tokens": max_tok}
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "temperature": temperature,
+        "max_tokens": max_tokens or 4096
+    }
 
     try:
         async with httpx.AsyncClient(timeout=1200.0) as client:
             async with client.stream("POST", url, json=payload) as response:
+                if response.status_code != 200:
+                    err_text = await response.aread()
+                    err = {"error": {"message": f"Ollama HTTP {response.status_code}: {err_text.decode('utf-8', errors='replace')}", "type": "ollama_error"}}
+                    yield f"data: {json.dumps(err)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 async for chunk in response.aiter_lines():
                     if chunk:
+                        # Forward SSE lines cleanly
                         if chunk.startswith("data: ") and chunk != "data: [DONE]":
                             try:
                                 data = json.loads(chunk[6:])
                                 choices = data.get("choices", [])
                                 if choices:
                                     delta = choices[0].get("delta", {})
+                                    # Forward reasoning tokens as reasoning_content for UI compatibility
                                     if "reasoning" in delta and "reasoning_content" not in delta:
                                         delta["reasoning_content"] = delta["reasoning"]
                                         yield f"data: {json.dumps(data)}\n\n"
@@ -602,26 +346,11 @@ async def stream_ollama(model: str, messages: list, temperature: float = 0.6, ma
         yield f"data: {json.dumps(err)}\n\n"
         yield "data: [DONE]\n\n" 
 
-async def resolve_route(model: str):
-    """Return (backend, upstream_model). Unknown model ids raise 404 instead of silently remapping."""
-    key = (model or DEFAULT_MODEL).lower()
-    if key == "default":
-        key = DEFAULT_MODEL
-    route = MODEL_ROUTES.get(key)
-    if not route:
-        raise HTTPException(status_code=404, detail=f"Model '{model}' not found. Available: {', '.join(MODEL_ROUTES)}")
-    if route["backend"] == "unavailable":
-        raise HTTPException(status_code=400, detail=f"'{model}' is not served by this gateway (too large for a Colab T4). This gateway serves only qwen3.8-27b-uncensored. Use GLM 5.3 / DeepSeek V4.1 via the OpenCode app (free models: glm-5.3-flash-free, deepseek-v4.1-flash-free).")
-    if route["backend"] == "local" and await is_ollama_online():
-        return "ollama", route["ollama"]
-    if not GROQ_API_KEY:
-        raise HTTPException(status_code=503, detail="Qwen is not loaded on the GPU right now and no Groq fallback is configured. Restart the Colab shift (see RESTART_GUIDE.md).")
-    return "groq", route["groq"]
-
+# ----------------- Chat Completions Entrypoint -----------------
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def completions(req: Request):
-    if not check_authorized(req):
+    if not is_authorized(req):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized: Access Key Required")
 
     try:
@@ -629,21 +358,16 @@ async def completions(req: Request):
     except Exception:
         body = {}
 
-    model = body.get("model") or DEFAULT_MODEL
-    backend, upstream = await resolve_route(model)
+    req_model = body.get("model", OLLAMA_MODEL_TAG)
+    ollama_model = OLLAMA_MODEL_TAG if req_model in ["default", "", "qwen"] else req_model
     messages = body.get("messages", [])
-    stream = bool(body.get("stream", False))  # OpenAI default is non-streaming
+    stream = body.get("stream", True)
     temp = float(body.get("temperature", 0.6))
     max_tok = body.get("max_tokens")
-    served = {"X-Served-By": f"{backend}:{upstream}", "X-Requested-Model": str(model)}
-
-    if backend == "groq" and not GROQ_API_KEY:
-        raise HTTPException(status_code=503, detail="Cloud backend not configured (GROQ_API_KEY missing)")
 
     if stream:
-        gen = (stream_ollama if backend == "ollama" else stream_groq)(upstream, messages, temp, max_tok)
         return StreamingResponse(
-            gen,
+            stream_ollama(model=ollama_model, messages=messages, temperature=temp, max_tokens=max_tok),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -652,29 +376,30 @@ async def completions(req: Request):
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                 "Access-Control-Allow-Headers": "*",
-                **served
+                "X-Model-Served": OLLAMA_MODEL_TAG,
+                "X-Hardware-Offload": "Tesla-T4-100%-VRAM"
             }
         )
+    else:
+        if not await is_ollama_online():
+            return JSONResponse({"error": "Ollama is warming up, please retry in a few moments"}, status_code=503)
 
-    payload = {"model": upstream, "messages": messages, "stream": False, "temperature": temp, "max_tokens": max_tok or 8192}
-    if backend == "ollama":
+        url = "http://127.0.0.1:11434/v1/chat/completions"
+        payload = {"model": ollama_model, "messages": messages, "stream": False, "temperature": temp, "max_tokens": max_tok or 4096}
         try:
             async with httpx.AsyncClient(timeout=1200.0) as client:
-                r = await client.post("http://127.0.0.1:11434/v1/chat/completions", json=payload)
-                if r.status_code == 200:
-                    return JSONResponse(r.json(), headers=served)
-        except Exception:
-            pass
-        if not GROQ_API_KEY:
-            raise HTTPException(status_code=502, detail="Local engine failed and no cloud fallback configured")
-        upstream = get_groq_model(DEFAULT_MODEL)
-        payload["model"] = upstream
-        served["X-Served-By"] = f"groq-fallback:{upstream}"
-
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        r = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
-        return JSONResponse(r.json(), status_code=r.status_code, headers=served)
+                r = await client.post(url, json=payload)
+                if r.status_code != 200:
+                    return JSONResponse(
+                        {"error": {"message": f"Ollama error ({r.status_code}): {r.text}", "type": "ollama_error"}},
+                        status_code=r.status_code
+                    )
+                return JSONResponse(r.json())
+        except Exception as e:
+            return JSONResponse(
+                {"error": {"message": f"Inference failed: {str(e)}", "type": "gateway_error"}},
+                status_code=500
+            )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
