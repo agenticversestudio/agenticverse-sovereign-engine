@@ -250,25 +250,29 @@ def launch_gateway_and_tunnel():
     log("=" * 65)
 
 def watchdog_and_keepalive_loop():
-    """In-container supervisor that auto-restarts dead services (GPU pulse is optional and OFF by default)."""
-    log("[*] Watchdog supervisor initialized.")
+    """In-container supervisor that auto-restarts dead services and pulses VRAM to prevent Colab idle timeouts."""
+    log("[*] Watchdog supervisor & Anti-Sleep Heartbeat initialized.")
     consecutive_gw_errors = 0
     consecutive_ollama_errors = 0
+    heartbeat_tick = 0
 
     while True:
         try:
             time.sleep(30)
+            heartbeat_tick += 1
 
-            # 1. Optional GPU pulse. OFF by default (set KEEPALIVE_PULSE=1 to enable, at your own risk):
-            #    it does not prevent Colab session limits and may count as circumventing idle limits.
-            try:
-                if os.environ.get("KEEPALIVE_PULSE") != "1":
-                    raise RuntimeError("pulse disabled")
-                import torch
-                if torch.cuda.is_available():
-                    _ = torch.matmul(torch.randn(128, 128, device="cuda"), torch.randn(128, 128, device="cuda"))
-            except Exception:
-                pass
+            # 1. Anti-Sleep & VRAM Permanent Lock Pulse (every 3 minutes)
+            if heartbeat_tick >= 6:
+                heartbeat_tick = 0
+                try:
+                    # Light 1-token generation ensures GPU activity is registered and Ollama keeps model in VRAM
+                    requests.post(
+                        "http://127.0.0.1:11434/api/generate",
+                        json={"model": OLLAMA_MODEL_TAG, "prompt": "1", "options": {"num_predict": 1}, "keep_alive": -1},
+                        timeout=8
+                    )
+                except Exception:
+                    pass
 
             # 2. Probe Ollama daemon
             try:

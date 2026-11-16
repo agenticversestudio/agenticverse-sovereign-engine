@@ -48,7 +48,6 @@ GDQ_API_KEY = os.environ.get("GDQ_API_KEY", "")
 GDQ_PASSKEY = os.environ.get("GDQ_PASSKEY", "")
 EXTRA_PASSKEY = os.environ.get("EXTRA_PASSKEY", "")
 ALLOWED_PASSKEYS = {p.strip() for p in [GDQ_PASSKEY, EXTRA_PASSKEY] if p.strip()}
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 OLLAMA_MODEL_TAG = os.environ.get("OLLAMA_MODEL_TAG", "qwen3.8-27b-uncensored")
 
 app = FastAPI(
@@ -220,10 +219,8 @@ async def process_status(req: Request):
         engine = "ollama"
     elif ollama_up:
         engine = "loading"
-    elif GROQ_API_KEY:
-        engine = "groq-fallback"
     else:
-        engine = "none"
+        engine = "offline"
 
     return {
         "status": "online" if engine == "ollama" else "degraded",
@@ -239,9 +236,14 @@ async def list_models(req: Request):
     if not is_authorized(req):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
+    now = int(time.time())
+    # Canonical aliases to ensure OpenCode, Cline, Continue, Cursor can select the model seamlessly
     models_list = [
-        {"id": OLLAMA_MODEL_TAG, "object": "model", "owned_by": "colab-router"},
-        {"id": "default", "object": "model", "owned_by": "colab-router"}
+        {"id": OLLAMA_MODEL_TAG, "object": "model", "created": now, "owned_by": "sovereign-qwen", "permission": []},
+        {"id": "qwen3.8-27b", "object": "model", "created": now, "owned_by": "sovereign-qwen", "permission": []},
+        {"id": "qwen", "object": "model", "created": now, "owned_by": "sovereign-qwen", "permission": []},
+        {"id": "qwen2.5-coder-32b", "object": "model", "created": now, "owned_by": "sovereign-qwen", "permission": []},
+        {"id": "default", "object": "model", "created": now, "owned_by": "sovereign-qwen", "permission": []}
     ]
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
@@ -251,42 +253,30 @@ async def list_models(req: Request):
                 for m in data.get("models", []):
                     name = m.get("name", "")
                     if name and name not in [x["id"] for x in models_list]:
-                        models_list.append({"id": name, "object": "model", "owned_by": "ollama"})
+                        models_list.append({"id": name, "object": "model", "created": now, "owned_by": "ollama", "permission": []})
     except Exception:
         pass
 
     return {"object": "list", "data": models_list}
 
-# ----------------- Fallback Groq Streamer (Optional) -----------------
-async def stream_groq(model: str, messages: list, temperature: float = 0.6, max_tokens: int = None):
-    if not GROQ_API_KEY:
-        err = {"error": {"message": "Ollama is warming up and GROQ_API_KEY fallback is not configured.", "type": "model_warming_up"}}
-        yield f"data: {json.dumps(err)}\n\n"
-        yield "data: [DONE]\n\n"
-        return
-
-    payload = {
-        "model": "qwen/qwen3.8-27b" if "qwen" in model.lower() else "openai/gpt-oss-120b",
-        "messages": messages,
-        "stream": True,
-        "temperature": temperature,
-        "max_tokens": max_tokens or 4096
-    }
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+# ----------------- Helper: Model Resolver -----------------
+async def resolve_target_model(requested_model: str) -> str:
+    clean = (requested_model or "").strip()
+    if not clean or clean in ["default", "qwen", "qwen3.8", "qwen3.8-27b", "qwen2.5-coder-32b", "gpt-4o", "gpt-4"]:
+        return OLLAMA_MODEL_TAG
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream("POST", "https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload) as response:
-                async for chunk in response.aiter_lines():
-                    if chunk:
-                        yield f"{chunk}\n\n"
-    except Exception as e:
-        err = {"error": {"message": f"Fallback error: {str(e)}", "type": "gateway_error"}}
-        yield f"data: {json.dumps(err)}\n\n"
-        yield "data: [DONE]\n\n"
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get("http://127.0.0.1:11434/api/tags")
+            if r.status_code == 200:
+                tags = [m.get("name") for m in r.json().get("models", [])]
+                if clean in tags or f"{clean}:latest" in tags:
+                    return clean
+    except Exception:
+        pass
+    return OLLAMA_MODEL_TAG
 
 # ----------------- Ollama SSE Streaming & Reasoning Sanitizer -----------------
 async def stream_ollama(model: str, messages: list, temperature: float = 0.6, max_tokens: int = None):
-    # Check if local Ollama is active; if warming up, optionally fallback to Groq
     ollama_ok = await is_ollama_online()
     if not ollama_ok:
         err = {"error": {"message": "Qwen 3.8 27B engine is initializing on Tesla T4 GPU. Please wait 30-60 seconds for VRAM warmup.", "type": "model_warming_up"}}
@@ -294,17 +284,10 @@ async def stream_ollama(model: str, messages: list, temperature: float = 0.6, ma
         yield "data: [DONE]\n\n"
         return
 
-    # If Ollama is up but model isn't in VRAM yet, warn client then proceed
-    # (request itself will still queue and wait; Ollama handles the load internally)
+    # If model is still locking into VRAM, send SSE comment keepalives so OpenCode doesn't timeout
     model_warm = await is_model_in_vram()
     if not model_warm:
-        # Emit a system notice as a comment so SSE doesn't break; real content follows
-        warmup_notice = {
-            "id": "warmup-notice",
-            "object": "chat.completion.chunk",
-            "choices": [{"delta": {"role": "assistant", "content": "⏳ [Model loading into GPU VRAM — first response may take 1-3 minutes. Subsequent responses are instant.]\n\n"}, "index": 0, "finish_reason": None}]
-        }
-        yield f"data: {json.dumps(warmup_notice)}\n\n"
+        yield ": warming_up_vram\n\n"
 
     url = "http://127.0.0.1:11434/v1/chat/completions"
     payload = {
@@ -358,8 +341,8 @@ async def completions(req: Request):
     except Exception:
         body = {}
 
-    req_model = body.get("model", OLLAMA_MODEL_TAG)
-    ollama_model = OLLAMA_MODEL_TAG if req_model in ["default", "", "qwen"] else req_model
+    req_model = body.get("model", "")
+    ollama_model = await resolve_target_model(req_model)
     messages = body.get("messages", [])
     stream = body.get("stream", True)
     temp = float(body.get("temperature", 0.6))
@@ -376,7 +359,7 @@ async def completions(req: Request):
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                 "Access-Control-Allow-Headers": "*",
-                "X-Model-Served": OLLAMA_MODEL_TAG,
+                "X-Model-Served": ollama_model,
                 "X-Hardware-Offload": "Tesla-T4-100%-VRAM"
             }
         )
